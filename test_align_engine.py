@@ -29,23 +29,6 @@ import time
 import traceback
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
-if ROOT not in sys.path:
-    sys.path.insert(0, ROOT)
-
-from wordsync_align import (  # noqa: E402
-    MAX_LOOKAHEAD_S,
-    AlignConfig,
-    PHONE_PLOSIVE,
-    PHONE_VOWEL,
-    align_words,
-    engine_unit_checks,
-    extract_features,
-    phone_duration_scale,
-    profile_feature_latency,
-    stay_cost,
-    write_wav,
-)
-
 FIXTURE_DIR = os.path.join(ROOT, '_align_fixtures')
 SR = 16000
 
@@ -54,9 +37,22 @@ def _load_word_sync():
     path = os.path.join(ROOT, 'word-sync(2).py')
     spec = importlib.util.spec_from_file_location('word_sync_mod', path)
     mod = importlib.util.module_from_spec(spec)
-    # The display script talks to MPRIS at import? No — import is safe.
     spec.loader.exec_module(mod)
     return mod
+
+
+ws = _load_word_sync()
+MAX_LOOKAHEAD_S = ws.MAX_LOOKAHEAD_S
+AlignConfig = ws.AlignConfig
+PHONE_PLOSIVE = ws.PHONE_PLOSIVE
+PHONE_VOWEL = ws.PHONE_VOWEL
+align_words = ws.align_words
+engine_unit_checks = ws.engine_unit_checks
+extract_features = ws.extract_features
+phone_duration_scale = ws.phone_duration_scale
+profile_feature_latency = ws.profile_feature_latency
+stay_cost = ws.stay_cost
+write_wav = ws.write_wav
 
 
 # ---------------------------------------------------------------------------
