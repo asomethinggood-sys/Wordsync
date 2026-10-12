@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-word_sync.py — v2.1 Stable (Universal Script Engine + corpus-trained cadence model, E2E-validated)
+word_sync.py — v2.2 (offline alignment engine: duration HMM, VAD freeze, formant onsets)
 Word-by-word terminal lyric display for MPRIS players (Spotify, playerctl).
 - Zero external Python dependencies (pure stdlib + playerctl, optional figlet/tk)
 - True terminal transparency: aesthetic ambient glow/halo around fonts instead of full-screen fills
@@ -27,6 +27,13 @@ Word-by-word terminal lyric display for MPRIS players (Spotify, playerctl).
   1 290 word onsets, 0 missed, +0.02 s median latency, +0.05 s p90, seek & pause/resume
   recovery clean; fixed repeated-word announcement ("la la la" re-pulses, event-index based);
   reproducible via e2e_test.py
+- v2.2: core offline alignment engine (`wordsync_align.py`) — phone-duration HMM
+  (cheap vowel self-loops / hard plosive ceilings), VAD-gated lyric-pointer freeze
+  (>400 ms instrumental), formant-band (300 Hz–3.4 kHz) soft onsets, adaptive DTW
+  corridor (no tempo-grid penalty on syncopation), lookahead capped at 150 ms with
+  a configurable STFT calibration offset. Heuristic cadence path unchanged when
+  no audio is supplied; `build_word_events(..., audio=)` refines onsets offline.
+  Regression: `python3 test_align_engine.py` and `--selftest`.
 - Natural vocal cadence & smart instrumental break / verse pause detection
 - Zero-flicker double-buffered renderer
 """
@@ -47,6 +54,26 @@ import time
 import unicodedata
 import urllib.parse
 import urllib.request
+
+# Offline audio-to-lyric engine (stdlib). Fail-soft: the heuristic cadence
+# path keeps working if the module is missing.
+try:
+    from wordsync_align import (  # type: ignore
+        AlignConfig, align_words, engine_unit_checks, phone_duration_scale,
+        refine_word_events,
+    )
+    _HAS_ALIGN = True
+except Exception:  # pragma: no cover - optional
+    _HAS_ALIGN = False
+
+    def phone_duration_scale(word):
+        return 1.0
+
+    def engine_unit_checks():
+        return []
+
+    def refine_word_events(events, audio, cfg=None):
+        return list(events)
 
 # --------------------------------------------------------------------------
 # ANSI constants
@@ -860,7 +887,7 @@ DEFAULTS = {
     'cache_dir': os.path.expanduser('~/.cache/word_sync'),
 }
 
-VERSION = '2.1 Stable'
+VERSION = '2.2'
 
 should_exit = False
 
@@ -1606,8 +1633,15 @@ def estimate_line(words, line_start, line_end, pace=DEFAULT_PACE):
     # songs (pace < ~0.55) stay linear.
     front = 1.0 + min(TUNE['front_max'], max(0.0, (pace - TUNE['front_on']) * TUNE['front_gain']))
     exp = TUNE['syl_exp']
-    weights = [k_ ** exp for k_ in syl] if exp != 1.0 else [float(k_) for k_ in syl]
-    wtotal = sum(weights)
+    # v2.2: blend the trained syllable weights with a phone-duration scale so
+    # vowel-heavy tokens (melisma) keep a larger share of the line while
+    # plosives stay snappy. The *span* is unchanged — only intra-line gaps
+    # move — so the v2 TUNE voiced-fraction / tail-shrink bounds still hold.
+    weights = []
+    for w, k_ in zip(words, syl):
+        base = (k_ ** exp) if exp != 1.0 else float(k_)
+        weights.append(base * phone_duration_scale(w))
+    wtotal = sum(weights) or 1.0
     base, acc = [], 0.0
     for wt in weights:
         base.append(span * ((acc / wtotal) ** front))
@@ -1664,14 +1698,19 @@ def normalise_line_starts(lines):
     return out
 
 
-def build_word_events(lines, total_duration, stretch=1.0, meta=None):
+def build_word_events(lines, total_duration, stretch=1.0, meta=None,
+                      audio=None, align_cfg=None):
     """Flatten lines into a sorted [(time, word_or_'')] timeline. '' clears the display
     (intro, instrumental break, or a genuine rest after a line).
 
     stretch  scales ESTIMATED word onsets about their own line start (line anchors stay exact,
              real per-word timings are never touched). >1 spreads words later, <1 earlier.
     meta     optional dict; receives {'estimated_lines': int, 'real_lines': int} so the UI can
-             tell the user whether the +/-/[/] controls will even do anything for this song."""
+             tell the user whether the +/-/[/] controls will even do anything for this song.
+    audio    optional WAV path, (sr, samples) tuple, or FeatureTrack. When supplied,
+             the v2.2 offline engine refines onsets (VAD freeze, formant onsets,
+             duration-aware search). Heuristic timeline is always built first.
+    align_cfg optional AlignConfig (lookahead cap, calibration offset, freeze)."""
     if not lines:
         return []
     lines = normalise_line_starts(lines)
@@ -1741,6 +1780,14 @@ def build_word_events(lines, total_duration, stretch=1.0, meta=None):
         cleaned.append(ev)
     if meta is not None:
         meta['estimated_lines'], meta['real_lines'] = n_est, n_real
+        meta['aligned'] = False
+    if audio is not None and cleaned and _HAS_ALIGN:
+        try:
+            cleaned = refine_word_events(cleaned, audio, align_cfg)
+            if meta is not None:
+                meta['aligned'] = True
+        except Exception:
+            pass
     return cleaned
 
 
@@ -2278,11 +2325,25 @@ def run_selftest():
     # phrase may never exceed ~6.2 s of onsets (no crawling into the rest)
     check(first_line_span(7.0) < 6.2, 'ballad words stay with the vocal (no late drift)')
 
+    # v2.2: vowel-heavy first words keep a longer intra-line share than
+    # plosive-heavy ones (second-onset delay). Line *span* is unchanged.
+    love = estimate_line(['love', 'x'], 0.0, 4.0, pace=0.55)
+    stop = estimate_line(['strict', 'x'], 0.0, 4.0, pace=0.55)
+    love_on = [t for t, w in love if w]
+    stop_on = [t for t, w in stop if w]
+    check(len(love_on) >= 2 and len(stop_on) >= 2
+          and love_on[1] >= stop_on[1] - 1e-6,
+          'vowel duration share (love vs strict)')
+
+    for label in engine_unit_checks():
+        fails.append('align/' + label)
+    check(_HAS_ALIGN, 'wordsync_align import')
+
     if fails:
         sys.stderr.write('selftest FAILED:\n  ' + '\n  '.join(fails) + '\n')
         return 1
     sys.stdout.write(f'selftest OK — {len(FONTS)} fonts x {len(samples)} scripts, '
-                     'parser, syllables and timing all pass\n')
+                     'parser, syllables, timing and align engine all pass\n')
     return 0
 
 

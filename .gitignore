@@ -1,0 +1,4 @@
+_align_fixtures/
+__pycache__/
+*.pyc
+.pytest_cache/
