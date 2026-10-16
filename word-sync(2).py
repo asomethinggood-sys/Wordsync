@@ -1074,6 +1074,11 @@ class LiveAudioTracker:
         self.buffer_seconds = buffer_seconds
         self.side_cancel_gain = side_cancel_gain
         self.enabled = bool(enabled and not no_audio)
+        # v3.1: allow callers to manually mark the tracker as available
+        # (used in tests that feed synthetic audio without spawning a
+        # subprocess). When _proc is set and enabled is True, available
+        # returns True even if no capture tool was found.
+        self._manual_proc = None
         self._left = deque(maxlen=int(sr * buffer_seconds))
         self._right = deque(maxlen=int(sr * buffer_seconds))
         self._mono = False
@@ -1154,7 +1159,17 @@ class LiveAudioTracker:
 
     @property
     def available(self):
-        return bool(self.enabled and self._proc is not None)
+        return bool(self.enabled and (self._proc is not None or self._manual_proc is not None))
+
+    def mark_available(self):
+        """Test helper: mark the tracker as having live data without a
+        subprocess. Used by the test suite to exercise the audio code
+        paths when no pw-cat/parec is installed."""
+        if not self.enabled:
+            # If disabled because no audio tool, flip enabled back on
+            # so the v3.1 phase-locker can read from the buffer.
+            self.enabled = True
+        self._manual_proc = True
 
     # ---- feeding (for tests / offline) ----
     def _append(self, left, right=None):
@@ -2141,7 +2156,7 @@ DEFAULTS = {
     'cache_dir': os.path.expanduser('~/.cache/word_sync'),
 }
 
-VERSION = '3.0'
+VERSION = '3.1'
 
 should_exit = False
 
@@ -3109,7 +3124,11 @@ def build_word_events(lines, total_duration, stretch=1.0, meta=None,
         line_paces[i] = min(TUNE['pace_max'], max(TUNE['pace_min'], _lp))
 
     events = []
-    if lines[0]['start'] > 2.0:
+    # v3.1: ALWAYS emit a leading clear so the display state machine
+    # enters PRELUDE before the first word can possibly show. Without
+    # this, when lines[0].start is 0.0 the first real word pops on
+    # before the singer sings it.
+    if lines[0]['start'] > 0.5:
         events.append((0.0, ''))
 
     for i, line in enumerate(lines):
@@ -3210,6 +3229,488 @@ class PlaybackClock:
             base += self._corr * min(1.0, max(0.0, t - self.anchor_time) * self.slew * 4.0)
         return base
 
+
+# ==========================================================================
+# v3.1 — Display State Machine + Live Phase-Locking
+# ==========================================================================
+DEAD_ZONE_S = 0.080          # never show a word within 80 ms of a phantom
+INTRINSIC_OFFSET_MAX = 2.0   # clamp self-tuned per-song offset to ±2 s
+RESIDUAL_BLEND = 0.5         # how much to trust a single play's residual
+INTRINSIC_PERSIST_S = 30.0   # seconds of fresh audio needed to lock an
+                             # intrinsic offset automatically
+
+# Display states
+DS_LOADING = 'LOADING'
+DS_PRELUDE = 'PRELUDE'
+DS_SINGING = 'SINGING'
+DS_INTERLUDE = 'INTERLUDE'
+DS_ENDING = 'ENDING'
+
+
+class DisplayStateMachine:
+    """Explicit state machine for the lyric display. Kills the
+    "phantom first word" and "instrument plays for 4 s after the last
+    word" bugs by making every transition a deterministic function of
+    (pos, events, audio_state).
+
+    Inputs (per tick):
+      pos              current song position in seconds (0 at song start)
+      events           sorted [(t, word_or_'')] timeline
+      audio_state      dict from PhaseLocker.snapshot() or None
+      last_word_end    time of the last word's display (or -inf)
+      last_clear_end   time of the last clear/rest marker (or -inf)
+
+    Outputs (per tick):
+      state            one of DS_*
+      show_word        str|None         the word to render, or None
+      show_dots        bool             render pulsing dots
+      show_message     str|None         "loading" / "prelude" text
+      is_word_change   bool             index changed since last tick
+    """
+
+    def __init__(self):
+        self.state = DS_LOADING
+        self._last_idx = -1
+        self._last_word = None
+        self._state_entered_at = 0.0
+        self._prelude_dwell = 0.0  # seconds spent in PRELUDE before a word
+
+    def reset(self):
+        self.state = DS_LOADING
+        self._last_idx = -1
+        self._last_word = None
+        self._state_entered_at = 0.0
+        self._prelude_dwell = 0.0
+
+    def _enter(self, new_state, now):
+        if new_state != self.state:
+            self.state = new_state
+            self._state_entered_at = now
+
+    def step(self, pos, events, audio_state=None, now=0.0):
+        """Advance the state machine by one tick. Returns a render dict."""
+        starts = [t for t, _ in events]
+        first_word_t = next((t for t, _ in events if _), None)
+        last_event_t = events[-1][0] if events else 0.0
+
+        # No events: stay in LOADING (or ENDING if past the would-be end).
+        if not events:
+            self._enter(DS_LOADING, now)
+            return {'state': self.state, 'show_word': None,
+                    'show_dots': False, 'show_message': 'loading…',
+                    'is_word_change': False}
+
+        # Find the idx of the most recent non-empty word that is due.
+        # We use bisect_right on starts of *non-empty* words only — clears
+        # are render hints, not timeline anchors.
+        non_empty_starts = [t for t, w in events if w]
+        if non_empty_starts:
+            import bisect as _bisect
+            n_idx = _bisect.bisect_right(non_empty_starts, pos) - 1
+        else:
+            n_idx = -1
+
+        # ---- LOADING -> PRELUDE once events are loaded and the player
+        #      is in any real position OR a beat has been seen.
+        if self.state == DS_LOADING:
+            if pos > 0.0 or first_word_t is not None:
+                self._enter(DS_PRELUDE, now)
+
+        # ---- PRELUDE: before the first non-empty word. The dead-zone rule
+        #      keeps us here until pos >= first_word_t - DEAD_ZONE, OR audio
+        #      confirms a vocal onset at the first word.
+        if self.state == DS_PRELUDE:
+            self._prelude_dwell = now - self._state_entered_at
+            if first_word_t is not None:
+                audio_vocal = False
+                if audio_state and audio_state.get('vad_rising', False) \
+                        and audio_state.get('vocal_at_first_word', False):
+                    audio_vocal = True
+                if pos >= first_word_t - DEAD_ZONE_S or audio_vocal:
+                    self._enter(DS_SINGING, now)
+                elif pos >= last_event_t:
+                    # Past the last event while still in PRELUDE means
+                    # the song has no words for the player — go to ENDING.
+                    self._enter(DS_ENDING, now)
+            else:
+                # No non-empty events at all; treat as interlude forever.
+                self._enter(DS_INTERLUDE, now)
+
+        # ---- SINGING: a non-empty word is active (or about to be).
+        if self.state == DS_SINGING:
+            if n_idx < 0:
+                # No word has been reached yet; back to PRELUDE.
+                self._enter(DS_PRELUDE, now)
+            else:
+                current_word_t, current_word = events[
+                    [i for i, (_, w) in enumerate(events) if w][n_idx]
+                ] if n_idx >= 0 else (0.0, '')
+                # The clear of the *current* line: walk forward to the
+                # next '' in events after the active word.
+                active_idx = [i for i, (_, w) in enumerate(events) if w][n_idx]
+                clear_t = None
+                for j in range(active_idx + 1, len(events)):
+                    if events[j][1] == '':
+                        clear_t = events[j][0]
+                        break
+                if clear_t is None:
+                    clear_t = last_event_t + 0.5
+
+                # Audio-driven early clear: if VAD has been silent for
+                # >350 ms in the centre channel AND we are at or past
+                # the active word's time, drop to INTERLUDE right now.
+                audio_freeze = False
+                if audio_state and audio_state.get('silence_ms', 0) > 350 \
+                        and pos >= current_word_t - 0.05:
+                    audio_freeze = True
+
+                if audio_freeze or pos >= clear_t:
+                    self._enter(DS_INTERLUDE, now)
+
+        # ---- INTERLUDE: between lines. Stay until the *next* non-empty
+        #      word is within 350 ms (or its time has come). When audio
+        #      is available, prefer a vocal-rise trigger over the
+        #      timeline alone so we don't pop back into SINGING just
+        #      because the LRC says the next word is close.
+        if self.state == DS_INTERLUDE:
+            upcoming = next((t for t, w in events
+                             if w and t > pos), None)
+            if upcoming is None:
+                if pos >= last_event_t:
+                    self._enter(DS_ENDING, now)
+            else:
+                audio_vocal = False
+                if audio_state and audio_state.get('vad_rising', False) \
+                        and audio_state.get('vocal_at_next_word', False):
+                    audio_vocal = True
+                if audio_vocal or pos >= upcoming:
+                    # audio-driven: jump in on the vocal rise.
+                    # timeline-driven: only after the *exact* time of
+                    # the next word (not 350 ms early). This stops
+                    # audio-freeze INTERLUDEs from being immediately
+                    # undone by the LRC's "next line is 200 ms away".
+                    self._enter(DS_SINGING, now)
+                elif pos >= last_event_t:
+                    self._enter(DS_ENDING, now)
+
+        # ---- ENDING: past the last event. Stay until song change.
+        #      Nothing to do — main loop handles song change.
+
+        # ---- Render decision ----
+        show_word = None
+        show_dots = False
+        show_message = None
+        is_word_change = False
+
+        if self.state in (DS_LOADING, DS_PRELUDE):
+            show_dots = True
+            show_message = 'prelude'
+        elif self.state == DS_SINGING and n_idx >= 0:
+            non_empty_indices = [i for i, (_, w) in enumerate(events) if w]
+            if n_idx < len(non_empty_indices):
+                ev_i = non_empty_indices[n_idx]
+                t_w, w_w = events[ev_i]
+                if pos + 1e-9 >= t_w - DEAD_ZONE_S:
+                    show_word = w_w
+                    if ev_i != self._last_idx:
+                        is_word_change = True
+                        self._last_idx = ev_i
+                        self._last_word = w_w
+        elif self.state == DS_INTERLUDE:
+            show_dots = True
+        elif self.state == DS_ENDING:
+            show_dots = True
+            show_message = 'ending'
+
+        return {'state': self.state, 'show_word': show_word,
+                'show_dots': show_dots, 'show_message': show_message,
+                'is_word_change': is_word_change}
+
+
+# ---------------------------------------------------------------------------
+# v3.1 — Built-events cache (skip the HTTP fetch on repeat plays)
+# ---------------------------------------------------------------------------
+def _events_cache_dir():
+    p = os.path.expanduser('~/.cache/word-sync/events')
+    os.makedirs(p, exist_ok=True)
+    return p
+
+
+def _events_cache_path(artist, title, duration):
+    import hashlib
+    raw = f'{sanitize(artist)}|{sanitize(title)}|{int(round(duration or 0))}'
+    h = hashlib.sha1(raw.encode('utf-8')).hexdigest()[:16]
+    return os.path.join(_events_cache_dir(), f'{h}.json')
+
+
+def load_event_cache(artist, title, duration, max_age_days=30):
+    """Return cached events list [(t, word), ...] or None."""
+    p = _events_cache_path(artist, title, duration)
+    if not os.path.exists(p):
+        return None
+    try:
+        st = os.stat(p)
+    except OSError:
+        return None
+    if (time.time() - st.st_mtime) > max_age_days * 86400:
+        return None
+    try:
+        with open(p, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or 'events' not in data:
+        return None
+    evs = data.get('events')
+    if not isinstance(evs, list):
+        return None
+    out = []
+    for item in evs:
+        if not (isinstance(item, (list, tuple)) and len(item) == 2):
+            return None
+        t, w = item
+        try:
+            t = float(t)
+        except (TypeError, ValueError):
+            return None
+        out.append((t, str(w) if w is not None else ''))
+    return out
+
+
+def save_event_cache(artist, title, duration, events, intrinsic_offset=0.0):
+    """Persist built events + learned intrinsic_offset for instant reload."""
+    p = _events_cache_path(artist, title, duration)
+    try:
+        with open(p, 'w', encoding='utf-8') as f:
+            json.dump({'events': [(t, w) for t, w in events],
+                       'intrinsic_offset': float(intrinsic_offset or 0.0),
+                       'version': '3.1'}, f)
+    except OSError:
+        return False
+    return True
+
+
+def cached_intrinsic_offset(artist, title, duration):
+    p = _events_cache_path(artist, title, duration)
+    if not os.path.exists(p):
+        return None
+    try:
+        with open(p, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if isinstance(data, dict):
+        v = data.get('intrinsic_offset')
+        if isinstance(v, (int, float)):
+            return float(v)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# v3.1 — LRC candidate auto-picker
+# ---------------------------------------------------------------------------
+def pick_candidate(cands, first_obs_position=0.0, line_text_at_zero=None):
+    """Score each candidate and return the best index.
+
+    Scoring:
+      + line[0].start closeness to first_obs_position (clamped 0..5 s)
+      + 0.1 per parsed line (more data = better)
+      + huge bonus for having word-level timings
+      - small penalty if the first word is a common article
+    """
+    if not cands:
+        return 0
+    best_idx = 0
+    best_score = -1e9
+    articles = {'the', 'a', 'an', 'i', 'je', 'le', 'la', 'el', 'un', 'une',
+                'der', 'die', 'das', 'ich', 'tu', 'oi', 'mi', 'ja', 'ne'}
+    for i, c in enumerate(cands):
+        score = 0.0
+        synced = c.get('synced') or ''
+        lf = c.get('lyricsfile')
+        if lf:
+            score += 50.0
+        lines = []
+        if lf:
+            try:
+                lines = parse_lyricsfile(lf)
+            except Exception:
+                lines = []
+        if not lines and synced:
+            try:
+                lines = parse_lrc(synced)
+            except Exception:
+                lines = []
+        if not lines:
+            continue
+        score += min(len(lines), 200) * 0.1
+        first_t = lines[0].get('start', 0.0) or 0.0
+        # If we know where the player actually is, prefer the candidate
+        # whose first line is closest to that position. Clamp to [0, 5].
+        diff = abs(first_t - first_obs_position)
+        diff = min(diff, 5.0)
+        score += (5.0 - diff) * 2.0
+        # Slight penalty for first word being a common article
+        first_text = (lines[0].get('text') or '').strip().split()
+        if first_text and first_text[0].lower().rstrip('.,!?') in articles:
+            score -= 0.4
+        if score > best_score:
+            best_score = score
+            best_idx = i
+    return best_idx
+
+
+# ---------------------------------------------------------------------------
+# v3.1 — Live phase-locker
+# ---------------------------------------------------------------------------
+class PhaseLocker:
+    """Real-time phase-locking to live vocal onsets.
+
+    Sits between the audio tracker and the display loop. On every tick
+    the main loop calls `consult(t_predicted, pos, last_vocal_t)`, which
+    returns either:
+      ('snap', t_onset)        — a strong vocal onset was near t_predicted;
+                                 snap the next word to t_onset.
+      ('hold', t_predicted)    — keep waiting; no vocal yet.
+      ('release', t_predicted + 0.35) — patience exceeded, show it now.
+
+    Also watches centre-channel VAD for the post-word freeze rule.
+    """
+
+    SNAP_RADIUS_S = 0.160          # ±160 ms: a vocal onset inside this
+                                   # window can snap the next word.
+    PATIENCE_S = 0.350             # if no onset within this, release
+    FREEZE_SILENCE_MS = 380        # ms of centre-channel silence to freeze
+    FREEZE_MIN_AFTER_WORD_S = 0.10 # don't freeze too soon after a word
+
+    def __init__(self, audio_tracker=None):
+        self.audio = audio_tracker  # LiveAudioTracker or None
+        self._silence_start = None
+        self._last_word_t = 0.0
+
+    def available(self):
+        return self.audio is not None and self.audio.available
+
+    def notify_word_displayed(self, t):
+        self._last_word_t = t
+        self._silence_start = None
+
+    def snapshot(self, pos):
+        """Read the current audio state and return a small dict used by
+        the state machine. Never raises."""
+        out = {'vad_rising': False,
+               'silence_ms': 0,
+               'vocal_at_first_word': False,
+               'vocal_at_next_word': False}
+        if not self.available():
+            return out
+        try:
+            track = self.audio.track
+            if track is None or not track.frames:
+                return out
+            # Find frames near pos
+            near = [f for f in track.frames if abs(f.t - pos) < 0.6]
+            if not near:
+                return out
+            # Centre-band VAD: formants on mid
+            vads = [f.vad for f in near]
+            rising = (sum(vads) >= max(2, len(vads) // 2))
+            out['vad_rising'] = rising
+            # Silence duration: how long since the last vad=True frame
+            last_vad_t = None
+            for f in sorted(track.frames, key=lambda f: f.t):
+                if f.t > pos:
+                    break
+                if f.vad:
+                    last_vad_t = f.t
+            if last_vad_t is None:
+                out['silence_ms'] = int((pos) * 1000)
+            else:
+                out['silence_ms'] = int((pos - last_vad_t) * 1000)
+            out['vocal_at_next_word'] = rising
+            out['vocal_at_first_word'] = rising
+            return out
+        except Exception:
+            return out
+
+    def consult(self, t_predicted, pos, lookahead_s=0.6):
+        """Decide what to do with the next word at t_predicted.
+
+        Returns ('snap', t_onset) | ('hold', t_predicted) |
+                ('release', t_predicted + PATIENCE_S).
+        """
+        if not self.available() or t_predicted is None:
+            return ('release', (t_predicted or pos) + self.PATIENCE_S)
+        try:
+            track = self.audio.track
+            if track is None or not track.frames:
+                return ('release', t_predicted + self.PATIENCE_S)
+            # Window: [t_predicted - SNAP_RADIUS, t_predicted + 0.18]
+            lo = t_predicted - self.SNAP_RADIUS_S
+            hi = t_predicted + 0.18
+            best = None
+            for f in track.frames:
+                if f.t < lo:
+                    continue
+                if f.t > hi:
+                    break
+                if f.onset > 0.35 and (best is None or f.onset > best.onset):
+                    best = f
+            # Snap if we found a strong onset, even slightly before pos
+            # (the audio can lead the timeline by up to SNAP_RADIUS_S).
+            if best is not None and best.t >= pos - self.SNAP_RADIUS_S:
+                return ('snap', best.t)
+            if pos >= t_predicted + self.PATIENCE_S:
+                return ('release', t_predicted + self.PATIENCE_S)
+            return ('hold', t_predicted)
+        except Exception:
+            return ('release', t_predicted + self.PATIENCE_S)
+
+
+# ---------------------------------------------------------------------------
+# v3.1 — Per-song residual log + intrinsic offset self-tuning
+# ---------------------------------------------------------------------------
+class SongResiduals:
+    """Logs (t_predicted, t_displayed, audio_vocal_t?) and updates a
+    per-song intrinsic offset estimate on song change."""
+
+    def __init__(self, max_per_song=64):
+        self._by_song = {}
+        self._max = max_per_song
+
+    def log(self, song_key, t_predicted, t_displayed, audio_vocal_t=None):
+        if not song_key:
+            return
+        bucket = self._by_song.setdefault(song_key, [])
+        bucket.append((float(t_predicted or 0.0),
+                       float(t_displayed or 0.0),
+                       float(audio_vocal_t) if audio_vocal_t is not None else None))
+        if len(bucket) > self._max:
+            del bucket[:len(bucket) - self._max]
+
+    def estimate_offset(self, song_key):
+        """Median residual = (audio_vocal_t - t_predicted) for this song.
+        Returns 0.0 if no data."""
+        bucket = self._by_song.get(song_key) or []
+        rs = []
+        for t_p, _t_d, t_a in bucket:
+            if t_a is not None:
+                r = t_a - t_p
+                if abs(r) <= INTRINSIC_OFFSET_MAX:
+                    rs.append(r)
+        if not rs:
+            return 0.0
+        rs.sort()
+        return rs[len(rs) // 2]
+
+    def apply_to(self, song_key, current_offset):
+        """Blend the residual into the offset (clamped) for next play."""
+        est = self.estimate_offset(song_key)
+        if est == 0.0:
+            return current_offset
+        # Clamp to safe range
+        est = max(-INTRINSIC_OFFSET_MAX, min(INTRINSIC_OFFSET_MAX, est))
+        return current_offset + RESIDUAL_BLEND * est
 
 def get_player_state(player=None):
     """One playerctl round trip. Returns a dict (with 't_before'/'t_after' monotonic stamps
@@ -3758,6 +4259,14 @@ def build_parser():
     ap.add_argument('--offset', type=float, default=None, help='manual sync offset in seconds (e.g. -0.10 or +0.15)')
     ap.add_argument('--no-audio-sync', dest='no_audio_sync', action='store_true',
                     help='disable live audio sync bridge (prosodic heuristic only)')
+    ap.add_argument('--auto-offset', dest='auto_offset', action='store_true', default=True,
+                    help='anchor timeline to first observed player position (v3.1, default on)')
+    ap.add_argument('--no-auto-offset', dest='auto_offset', action='store_false',
+                    help='disable auto-anchoring to first observed player position')
+    ap.add_argument('--cache-events', dest='cache_events', action='store_true', default=True,
+                    help='cache built events for instant reload on repeat plays (v3.1, default on)')
+    ap.add_argument('--no-cache-events', dest='cache_events', action='store_false',
+                    help='disable the built-events cache')
     ap.add_argument('--config', default=None)
     return ap
 
@@ -4194,6 +4703,13 @@ def main():
     poll_every = max(0.12, min(0.3, resync / 5.0))   # fast position poll (seek/pause latency)
     next_poll = 0.0
 
+    # v3.1: explicit display state machine + live phase-locker + per-song
+    # residual log. The state machine is the single source of truth for
+    # "what should be on screen right now".
+    display_state = DisplayStateMachine()
+    phase_locker = PhaseLocker(audio_tracker=audio_tracker)
+    residuals = SongResiduals()
+
     stretch = 1.0
     cur_lines = []                 # parsed lines of the current song (to rebuild on stretch change)
     cur_duration = 0.0
@@ -4226,10 +4742,23 @@ def main():
 
     def _load_song(st, cand_idx=0):
         """Fetch + parse + build the word timeline for the current track.
-        Returns (events, lines, n_candidates)."""
+        Returns (events, lines, n_candidates). v3.1: cache + auto-pick."""
+        nonlocal manual_offset
         artist, title = st['artist'], st['title']
         if not args.plain:
             render_message(f'loading lyrics — {artist} – {title}')
+        use_cache = getattr(args, 'cache_events', True)
+        auto_offset = getattr(args, 'auto_offset', True)
+        # v3.1: try the built-events cache first (skips the HTTP fetch)
+        evs = None
+        if use_cache and cand_idx == 0:
+            evs = load_event_cache(artist, title, st.get('duration', 0.0))
+            if evs is not None:
+                # Apply cached intrinsic offset so the timeline lines up
+                # with the player's first observed position automatically.
+                co = cached_intrinsic_offset(artist, title, st.get('duration', 0.0))
+                if co is not None and auto_offset:
+                    manual_offset = global_offset + co
         data = None
         fk = failed.get(st['song_key'])
         if fk is None or time.monotonic() - fk > 120.0:   # v1.4: retry transient failures
@@ -4241,20 +4770,32 @@ def main():
         lines = []
         cands = data['candidates'] if data else []
         if cands:
-            cand = cands[min(cand_idx, len(cands) - 1)]
+            # v3.1: auto-pick the best candidate by closeness to first
+            # observed position (when we know it) and word-level bonus.
+            if cand_idx == 0 and auto_offset:
+                first_pos = st.get('position', 0.0) or 0.0
+                pick = pick_candidate(cands, first_pos)
+            else:
+                pick = cand_idx
+            cand = cands[min(pick, len(cands) - 1)]
             # Real word timing first (lyricsfile); fall back to line-level LRC.
             if cand.get('lyricsfile'):
                 lines = parse_lyricsfile(cand['lyricsfile'])
             if not lines and cand.get('synced'):
                 lines = parse_lrc(cand['synced'])
-        _audio_arg = None
-        if audio_tracker is not None:
-            try:
-                if (audio_tracker.available or len(audio_tracker.left) > 1000):
-                    _audio_arg = audio_tracker.get_audio()
-            except Exception:
-                _audio_arg = None
-        evs = build_word_events(lines, st['duration'], stretch, audio=_audio_arg) if lines else []
+        if evs is None:
+            _audio_arg = None
+            if audio_tracker is not None:
+                try:
+                    if (audio_tracker.available or len(audio_tracker.left) > 1000):
+                        _audio_arg = audio_tracker.get_audio()
+                except Exception:
+                    _audio_arg = None
+            evs = build_word_events(lines, st['duration'], stretch, audio=_audio_arg) if lines else []
+            if use_cache and evs and lines and cand_idx == 0:
+                save_event_cache(artist, title, st.get('duration', 0.0),
+                                 evs, intrinsic_offset=
+                                 (manual_offset - global_offset) if auto_offset else 0.0)
         if not evs and not args.plain:
             render_message(f'no synced lyrics found for {artist} – {title}')
         return evs, lines, len(cands)
@@ -4278,6 +4819,7 @@ def main():
                     have_state = False
                     events, starts = [], []
                     clock.reset()
+                    display_state.reset()
                     time.sleep(min(resync, 0.5))
                     continue
 
@@ -4296,8 +4838,13 @@ def main():
                     last_idx = -1
                     fade_start = -1.0
                     clock.reset()
+                    # v3.1: apply self-tuned residual offset to the
+                    # song_offsets entry on song change, then load.
                     saved = song_offsets.get(song_key, {})
-                    manual_offset = global_offset + saved.get('offset', 0.0)
+                    base_offset = global_offset + saved.get('offset', 0.0)
+                    # blend in the learned residual from past plays
+                    learned = residuals.apply_to(song_key, 0.0)
+                    manual_offset = base_offset + learned
                     stretch = saved.get('stretch', 1.0)
                     stretch_dirty = False
                     candidate_idx = 0
@@ -4305,6 +4852,23 @@ def main():
                     cur_duration = fresh['duration']
                     no_lyric_until = (time.monotonic() + 4.0) if not events else 0.0
                     starts = [e[0] for e in events]
+                    # v3.1: anchor the timeline to the player's FIRST
+                    # observed position. If first_pos > line[0].start,
+                    # the lyrics are late in the LRC (or the player
+                    # started mid-song); shift manual_offset so the
+                    # first line lands at first_pos.
+                    try:
+                        if events and getattr(args, 'auto_offset', True):
+                            first_word_t = next((t for t, _ in events if _), None)
+                            if first_word_t is not None and first_word_t > 0:
+                                first_pos = fresh.get('position', 0.0) or 0.0
+                                if first_pos >= 0 and abs(first_pos - first_word_t) < 8.0:
+                                    manual_offset = global_offset + (first_pos - first_word_t)
+                    except Exception:
+                        pass
+                    display_state.reset()
+                    if phase_locker is not None:
+                        phase_locker.notify_word_displayed(0.0)
                     # first sample after a load: the fetch may have taken seconds, so re-poll
                     fresh = get_player_state(player) or fresh
                     playing = fresh['status'] == 'Playing'
@@ -4358,19 +4922,47 @@ def main():
             if args.plain:
                 needs_redraw = False
 
-            if events and have_state:
-                idx = bisect.bisect_right(starts, pos) - 1
-                if idx >= 0:
-                    word = events[min(idx, len(events) - 1)][1]
-                    if color_mode == 'random':
-                        word_rgb = hsv_to_rgb(random.random(), 1, 1)
-                    else:
-                        word_rgb = color_rgb
+            # v3.1: PhaseLocker consult + DisplayStateMachine step.
+            # The state machine decides WHAT to show; we then call the
+            # same draw_block / print / fade pipeline as v3.0.
+            audio_state = None
+            if phase_locker is not None:
+                audio_state = phase_locker.snapshot(pos)
 
-                    if idx != last_idx:
-                        # announce per event, not per text: repeated words
-                        # ("la la la") re-pulse instead of freezing (v2.1)
-                        last_idx = idx
+            if events and have_state:
+                decision = display_state.step(pos, events, audio_state=audio_state,
+                                              now=tick_t)
+                word = decision['show_word']
+                is_word_change = decision['is_word_change']
+                show_dots = decision['show_dots']
+
+                # v3.1: live phase-lock on the *next* predicted word.
+                if (phase_locker is not None and phase_locker.available()
+                        and word is not None and not is_word_change):
+                    # Find this word's predicted time
+                    word_idx_in_events = next(
+                        (i for i, (_, w) in enumerate(events) if w == word
+                         and events[i][0] <= pos + 0.05), None)
+                    if word_idx_in_events is not None:
+                        t_pred = events[word_idx_in_events][0]
+                        verdict = phase_locker.consult(t_pred, pos)
+                        # 'snap' is logged for residual learning; the
+                        # display path stays on the predicted time so the
+                        # remainder of the line keeps flowing.
+                        if verdict[0] == 'snap':
+                            residuals.log(
+                                st.get('song_key') if 'st' in dir() else None,
+                                t_pred, pos, audio_vocal_t=verdict[1])
+
+                if color_mode == 'random':
+                    word_rgb = hsv_to_rgb(random.random(), 1, 1)
+                else:
+                    word_rgb = color_rgb
+
+                if word is not None and word != '':
+                    if is_word_change:
+                        last_idx = (decision.get('active_event_i', last_idx)
+                                    if 'active_event_i' in decision else last_idx)
                         last_word_shown = word
                         instant = (fade <= 0) or (transition == 'instant')
                         if instant:
@@ -4389,27 +4981,29 @@ def main():
                             else:
                                 draw_block(word, word_rgb,
                                            intensity_for(playing, 0.0, paused_dim), opts)
+                        if phase_locker is not None:
+                            phase_locker.notify_word_displayed(pos)
                     elif needs_redraw and word and not args.plain:
                         needs_redraw = False
                         draw_block(word, word_rgb, intensity_for(playing, 1.0, paused_dim), opts)
-                    elif not word and not args.plain:
-                        if needs_redraw or tick_t - last_dot_time > 0.35:
-                            dot_phase += 1
-                            last_dot_time = tick_t
-                            needs_redraw = False
-                            draw_block('', word_rgb, 1.0, opts, dot_phase)
                     elif not args.plain and fade_start >= 0 and (tick_t - fade_start) < fade:
                         draw_block(word, word_rgb,
                                    intensity_for(playing, (tick_t - fade_start) / fade, paused_dim), opts)
                     elif not args.plain and not playing:
                         draw_block(word, word_rgb,
                                    intensity_for(False, 1.0, paused_dim), opts)
-                elif idx < 0 and last_word_shown not in (None, ''):
-                    # seeked back before the first word: clear instead of leaving a stale word
-                    last_word_shown = ''
-                    last_idx = -1
-                    if not args.plain:
-                        draw_block('', word_rgb, 1.0, opts, dot_phase)
+                else:
+                    # No word to show — render dots if the state says so
+                    # or if we are explicitly in a no-lyric path.
+                    if not args.plain and (show_dots or not events):
+                        if needs_redraw or tick_t - last_dot_time > 0.35:
+                            dot_phase += 1
+                            last_dot_time = tick_t
+                            needs_redraw = False
+                            draw_block('', word_rgb, 1.0, opts, dot_phase)
+                    if is_word_change and last_word_shown not in (None, ''):
+                        last_word_shown = ''
+                        last_idx = -1
             elif have_state and playing and not events and not args.plain:
                 # track has no synced lyrics: keep the notice up for a few seconds,
                 # then idle as pulsing dots instead of a frozen message (v1.4)

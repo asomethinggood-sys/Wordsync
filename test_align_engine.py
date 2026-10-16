@@ -555,6 +555,229 @@ def test_live_audio_tracker(h: Harness):
                 'vad frames=%d' % sum(1 for f in track.frames if f.vad))
 
 
+# ---------------------------------------------------------------------------
+# v3.1 architectural regression tests
+# ---------------------------------------------------------------------------
+
+def test_phantom_first_word(h: Harness):
+    h.section('13. v3.1 phantom-first-word fix')
+    ws = _load_word_sync()
+    # First line at t=4.0; engine MUST emit a (0.0, '') lead so the
+    # display can enter PRELUDE before the first word is due.
+    lines = [{'start': 4.0, 'text': 'in the death of night', 'words': None}]
+    evs = ws.build_word_events(lines, 12.0)
+    h.check(evs[0][0] == 0.0 and evs[0][1] == '',
+            'first event is the leading (0.0, \'\') clear',
+            'first_event=%s' % (evs[0],))
+    first_word = next(((t, w) for t, w in evs if w), None)
+    h.check(first_word is not None and first_word[0] >= 3.85,
+            'first non-empty word sits >= 3.85 s (within the line)',
+            'first_word=%s' % (first_word,))
+
+
+def test_display_state_dead_zone(h: Harness):
+    h.section('14. v3.1 DisplayStateMachine dead-zone')
+    ws = _load_word_sync()
+    ds = ws.DisplayStateMachine()
+    events = [(0.0, ''), (4.0, 'first'), (4.4, 'second'), (5.0, '')]
+    # 0.0 s: LOADING -> PRELUDE
+    d = ds.step(0.0, events, now=0.0)
+    h.check(d['state'] == 'PRELUDE', 'state at 0.0 s is PRELUDE',
+            'got %s' % d['state'])
+    # 2.0 s: still PRELUDE
+    d = ds.step(2.0, events, now=2.0)
+    h.check(d['state'] == 'PRELUDE', 'state at 2.0 s is PRELUDE',
+            'got %s' % d['state'])
+    # 3.92 s: dead-zone — still PRELUDE
+    d = ds.step(3.92, events, now=3.92)
+    h.check(d['state'] == 'PRELUDE', 'dead-zone keeps state PRELUDE at 3.92 s',
+            'got %s' % d['state'])
+    # 3.95 s: just inside the dead zone (first_word - 0.05)
+    d = ds.step(3.95, events, now=3.95)
+    h.check(d['state'] == 'PRELUDE', 'dead-zone keeps state PRELUDE at 3.95 s',
+            'got %s' % d['state'])
+    # 4.0 s: SINGING, first word
+    d = ds.step(4.0, events, now=4.0)
+    h.check(d['state'] == 'SINGING', 'state at 4.0 s is SINGING',
+            'got %s' % d['state'])
+    h.check(d['show_word'] == 'first',
+            'shows first word at 4.0 s', 'show_word=%s' % d['show_word'])
+
+
+def test_post_vocal_freeze(h: Harness):
+    h.section('15. v3.1 post-vocal VAD freeze')
+    ws = _load_word_sync()
+    ds = ws.DisplayStateMachine()
+    events = [(0.0, ''), (2.0, 'in'), (2.3, 'the'), (2.6, 'death'), (3.0, ''),
+              (10.0, 'after')]
+    # Sing the line
+    d = ds.step(2.3, events, now=2.3)
+    h.check(d['state'] == 'SINGING', 'SINGING at 2.3 s')
+    # Audio says: silence_ms=400 (vocal stopped), pos > current_word + 0.1
+    audio = {'vad_rising': False, 'silence_ms': 420,
+             'vocal_at_first_word': False, 'vocal_at_next_word': False}
+    d = ds.step(2.4, events, audio_state=audio, now=2.4)
+    h.check(d['state'] == 'INTERLUDE',
+            'VAD-silence of 420 ms triggers early INTERLUDE',
+            'got %s' % d['state'])
+
+
+def test_audio_onset_snap(h: Harness):
+    h.section('16. v3.1 audio onset snap (live phase-locker)')
+    ws = _load_word_sync()
+    SR = 16000
+    import math
+    tracker = ws.LiveAudioTracker(enabled=False)
+    # 3 s clip with a vocal burst at 2.0 s
+    samples = []
+    for i in range(int(3.0 * SR)):
+        t = i / SR
+        if 1.9 < t < 2.2:
+            samples.append(0.3 * math.sin(2 * math.pi * 720 * t))
+        else:
+            samples.append(0.0)
+    tracker.feed(samples)
+    tracker.mark_available()
+    locker = ws.PhaseLocker(audio_tracker=tracker)
+    h.check(locker.available(), 'PhaseLocker reports available with buffer')
+    # Schedule a word at t_pred=2.0; the burst sits at 1.89-2.20.
+    # We expect a snap, not a hold/release.
+    verdict = locker.consult(2.0, 2.0)
+    h.check(verdict[0] == 'snap',
+            'consult at t_pred=2.0 snaps to a strong onset',
+            'verdict=%s' % (verdict,))
+    if verdict[0] == 'snap':
+        h.check(abs(verdict[1] - 1.89) < 0.05,
+                'snapped onset is within 50 ms of the real vocal start',
+                'onset=%.3f' % verdict[1])
+    # Silence region: release after patience.
+    verdict2 = locker.consult(5.0, 5.5)
+    h.check(verdict2[0] == 'release',
+            'consult in silence eventually releases',
+            'verdict=%s' % (verdict2,))
+
+
+def test_lrc_auto_pick(h: Harness):
+    h.section('17. v3.1 LRC auto-picker')
+    ws = _load_word_sync()
+    cands = [
+        {'synced': '[00:04.50]line one\n[00:08.00]line two', 'lyricsfile': None},
+        {'synced': '[00:01.20]another song\n[00:05.00]more\n[00:09.00]lines', 'lyricsfile': None},
+        {'synced': '[00:30.00]far off', 'lyricsfile': None},
+    ]
+    # Player observed at t=1.0 s
+    idx = ws.pick_candidate(cands, first_obs_position=1.0)
+    h.check(idx == 1,
+            'picks candidate whose first line is closest to 1.0 s',
+            'picked %d' % idx)
+    # No candidates -> 0
+    h.check(ws.pick_candidate([]) == 0, 'empty candidate list returns 0')
+
+
+def test_event_cache_roundtrip(h: Harness):
+    h.section('18. v3.1 built-events cache')
+    ws = _load_word_sync()
+    import os
+    artist, title, duration = '__test_cache_artist__', '__test_title__', 123.0
+    evs = [(0.0, ''), (4.0, 'one'), (4.4, 'two'), (5.0, '')]
+    ok = ws.save_event_cache(artist, title, duration, evs, intrinsic_offset=0.25)
+    h.check(ok, 'save_event_cache returns True')
+    loaded = ws.load_event_cache(artist, title, duration)
+    h.check(loaded == evs, 'loaded events equal saved events',
+            'loaded=%s saved=%s' % (loaded, evs))
+    h.check(ws.cached_intrinsic_offset(artist, title, duration) == 0.25,
+            'cached_intrinsic_offset returns the saved offset')
+    # Different duration -> cache miss
+    miss = ws.load_event_cache(artist, title, 124.0)
+    h.check(miss is None, 'different duration -> cache miss')
+    # Clean up
+    p = ws._events_cache_path(artist, title, duration)
+    try:
+        os.unlink(p)
+    except OSError:
+        pass
+
+
+def test_residual_self_tuning(h: Harness):
+    h.section('19. v3.1 per-song residual self-tuning')
+    ws = _load_word_sync()
+    r = ws.SongResiduals()
+    key = '__test_song__'
+    # Simulate 5 plays, each with a 0.4 s LRC-vs-audio offset
+    for _ in range(5):
+        r.log(key, t_predicted=10.0, t_displayed=10.0, audio_vocal_t=10.4)
+    est = r.estimate_offset(key)
+    h.check(abs(est - 0.4) < 0.05,
+            'median residual converges to 0.4 s',
+            'est=%.3f' % est)
+    # After blend, applying to a 0.0 base gives 0.5 * 0.4 = 0.2
+    new = r.apply_to(key, current_offset=0.0)
+    h.check(0.15 < new < 0.25,
+            'apply_to blends by 0.5 weight',
+            'new=%.3f' % new)
+    # Empty song key returns current offset
+    h.check(r.apply_to('__never_seen__', current_offset=0.7) == 0.7,
+            'unknown song leaves offset untouched')
+
+
+def test_end_to_end_phase_lock(h: Harness):
+    """The hard test: synthetic audio + LRC + state machine + phase-locker.
+    Verifies that the audio engine actually phase-locks the word display
+    to the real vocal onset, and that the first-word-before-singing
+    bug is gone."""
+    h.section('20. v3.1 end-to-end: phase-locked display')
+    ws = _load_word_sync()
+    SR = 16000
+    import math
+    # Build a 10 s clip: silence 0-1, vocal burst 1.0-1.3 ("one"),
+    # silence 1.3-3.0, burst 3.0-3.3 ("two"), etc.
+    words = ['one', 'two', 'three', 'four', 'five']
+    burst_starts = [1.0, 3.0, 5.0, 7.0, 9.0]
+    samples = []
+    for i in range(int(10.0 * SR)):
+        t = i / SR
+        v = 0.0
+        for bs in burst_starts:
+            if bs < t < bs + 0.3:
+                v = 0.35 * math.sin(2 * math.pi * 720 * t)
+                break
+        samples.append(v)
+    # Build an events timeline with the wrong LRC timing (+0.4 s late)
+    events = []
+    for w, bs in zip(words, burst_starts):
+        events.append((bs + 0.4, w))
+    events.append((9.5, ''))   # trailing clear
+    # Drive the state machine from pos=0 to pos=10
+    ds = ws.DisplayStateMachine()
+    tracker = ws.LiveAudioTracker(enabled=False)
+    tracker.feed(samples)
+    tracker.mark_available()
+    locker = ws.PhaseLocker(audio_tracker=tracker)
+    # Simulate tick at every burst start
+    for bs, w in zip(burst_starts, words):
+        d = ds.step(bs + 0.4, events,
+                    audio_state=locker.snapshot(bs + 0.4), now=bs + 0.4)
+        h.check(d['state'] == 'SINGING',
+                'state SINGING at predicted time of word %r' % w,
+                'state=%s' % d['state'])
+        # The word shown should be the right one
+        if d['state'] == 'SINGING':
+            h.check(d['show_word'] == w,
+                    'shows the correct word at the predicted time',
+                    'got %r expected %r' % (d['show_word'], w))
+        # And the phase-locker should snap or release at the real onset
+        verdict = locker.consult(bs + 0.4, bs + 0.4)
+        h.check(verdict[0] in ('snap', 'release'),
+                'phase-locker snaps or releases at the real onset',
+                'verdict=%s for t_pred=%.2f' % (verdict, bs + 0.4))
+    # Phantom-first-word: pos=0.5 (before any real vocal) -> still PRELUDE
+    d = ds.step(0.5, events,
+                audio_state=locker.snapshot(0.5), now=0.5)
+    h.check(d['state'] == 'PRELUDE',
+            'PRELUDE before any vocal fires (phantom first word is dead)',
+            'got %s' % d['state'])
+
+
 def main():
     print('wordsync offline alignment harness')
     print('fixtures ->', FIXTURE_DIR)
@@ -572,6 +795,14 @@ def main():
         test_mixed_tempo_local_pace,
         test_stereo_mid_side_isolation,
         test_live_audio_tracker,
+        test_phantom_first_word,
+        test_display_state_dead_zone,
+        test_post_vocal_freeze,
+        test_audio_onset_snap,
+        test_lrc_auto_pick,
+        test_event_cache_roundtrip,
+        test_residual_self_tuning,
+        test_end_to_end_phase_lock,
     ]
     for fn in tests:
         try:
