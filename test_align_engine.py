@@ -371,6 +371,190 @@ def test_cadence_regression(h: Harness):
     h.check(meta.get('aligned') is True, 'meta.aligned set when audio given')
 
 
+# ---------------------------------------------------------------------------
+# v3.0 architectural regression tests
+# ---------------------------------------------------------------------------
+
+def _stereo_vocal_burst(burst_start, burst_end, total, sr=SR, vocal_amp=0.25,
+                        noise_amp=0.30, noise_freq=440.0, vocal_freq=720.0,
+                        pan_polarity=-1.0):
+    """Synthetic stereo fixture: wide-panned 300-3400 Hz noise + a center
+    vocal burst between burst_start and burst_end."""
+    n = int(total * sr)
+    L = [0.0] * n
+    R = [0.0] * n
+    bs = int(burst_start * sr)
+    be = int(burst_end * sr)
+    for i in range(n):
+        x = noise_amp * math.sin(2 * math.pi * noise_freq * i / sr)
+        L[i] = x
+        R[i] = pan_polarity * x
+    for i in range(bs, be):
+        t = i / sr
+        v = vocal_amp * math.sin(2 * math.pi * vocal_freq * t)
+        L[i] += v
+        R[i] += v
+    return L, R
+
+
+def test_panchiko_archetype(h: Harness):
+    h.section('8. v3.0 Panchiko / post-phrase instrumental gap archetype')
+    ws = _load_word_sync()
+    # 3 fast 2.2 s lines (4 words each) then a 6-syllable panchiko line
+    # inside a 6.5 s window.
+    lines = []
+    lines.append({'start': 0.0, 'text': 'one two three four', 'words': None})
+    lines.append({'start': 2.2, 'text': 'one two three four', 'words': None})
+    lines.append({'start': 4.4, 'text': 'one two three four', 'words': None})
+    base = 6.6
+    lines.append({'start': base, 'text': 'in the death of night', 'words': None})
+    lines.append({'start': base + 6.5, 'text': 'one two three', 'words': None})
+
+    evs = ws.build_word_events(lines, base + 13.0)
+    onsets = [t for t, w in evs if w and base <= t < base + 6.5]
+    clears = [t for t, w in evs if not w and base <= t < base + 6.5]
+    h.check(len(onsets) == 5, 'panchiko produces 5 word onsets',
+            'got %d (%s)' % (len(onsets), onsets))
+    if onsets:
+        span = onsets[-1] - onsets[0]
+        h.check(span <= 2.4,
+                'panchiko onsets complete inside vocal portion (<=2.4 s)',
+                'span=%.2f s' % span)
+    if clears:
+        first_clear = clears[0] - base
+        h.check(first_clear < 3.5,
+                'rest marker emitted before 3.5 s',
+                'first_clear=%.2f s' % first_clear)
+    else:
+        h.check(False, 'rest marker emitted before 3.5 s', 'no clear found')
+
+
+def test_function_word_and_caesura(h: Harness):
+    h.section('9. v3.0 Function-word compression + caesura micro-pause')
+    ws = _load_word_sync()
+    evs = ws.estimate_line(
+        ['Wait,', 'in', 'the', 'middle', 'of', 'the', 'night'],
+        0.0, 5.0, pace=0.5)
+    times = [t for t, _ in evs]
+    indexed = [(t, w.strip(',').lower()) for t, w in evs if w]
+    pos = {w: i for i, (t, w) in enumerate(indexed)}
+    ts = [t for t, _ in indexed]
+    # The function cluster "in the" should be tighter than the content
+    # straddle across "middle ... of the night" once we ignore the second
+    # "the" (which sits after the caesura-compressed content run).
+    if all(k in pos for k in ('in', 'the', 'middle', 'of', 'night')):
+        cluster_lo = pos['in']
+        cluster_hi_first = cluster_lo
+        for k in range(cluster_lo, pos['middle']):
+            if indexed[k][1] == 'the':
+                cluster_hi_first = k
+                break
+        cluster_width = ts[cluster_hi_first] - ts[cluster_lo]
+        middle_i = pos['middle']
+        night_i = pos['night']
+        content_width = ts[night_i] - ts[middle_i]
+        h.check(cluster_width < content_width,
+                'function cluster tighter than content run',
+                'cluster=%.3f content=%.3f' % (cluster_width, content_width))
+    # Pre-boundary lengthening on "Wait,": the gap to the next word should
+    # be at least the caesura micro-pause (0.20 s).
+    if indexed and indexed[0][1] == 'wait' and len(indexed) > 1:
+        next_gap = indexed[1][0] - indexed[0][0]
+        h.check(next_gap >= 0.20, 'post-comma caesura injected (>=0.20 s)',
+                'gap=%.3f s' % next_gap)
+
+
+def test_mixed_tempo_local_pace(h: Harness):
+    h.section('10. v3.0 Mixed-tempo / beat-switch local pace')
+    ws = _load_word_sync()
+    lines = []
+    for i in range(4):
+        lines.append({'start': i * 2.5,
+                      'text': ('one two three four five six seven eight '
+                               'nine ten eleven twelve'), 'words': None})
+    base = 4 * 2.5
+    for i in range(3):
+        lines.append({'start': base + i * 4.5,
+                      'text': 'slow soft song here now', 'words': None})
+    evs = ws.build_word_events(lines, base + 3 * 4.5)
+    # Find onsets per line
+    by_line = []
+    for idx, ln in enumerate(lines):
+        end = lines[idx + 1]['start'] if idx + 1 < len(lines) else ln['start'] + 4.5
+        on = [t for t, w in evs if w and ln['start'] <= t < end]
+        by_line.append(on)
+    # Fast lines: span ~2.0 s
+    fast_spans = [o[-1] - o[0] for o in by_line[:4] if o]
+    slow_spans = [o[-1] - o[0] for o in by_line[4:] if o]
+    h.check(all(s < 2.5 for s in fast_spans),
+            'rap lines stay tight (span < 2.5 s)',
+            'spans=%s' % [round(s, 2) for s in fast_spans])
+    h.check(all(s < 2.5 for s in slow_spans),
+            'chorus lines adapt locally (span < 2.5 s)',
+            'spans=%s' % [round(s, 2) for s in slow_spans])
+
+
+def test_stereo_mid_side_isolation(h: Harness):
+    h.section('11. v3.0 Stereo mid-side vocal isolation')
+    ws = _load_word_sync()
+    L, R = _stereo_vocal_burst(0.4, 2.0, 6.0)
+    path = save('stereo_burst.wav', L, sr=SR)
+    # Re-load as multi-channel? The harness write_wav is mono. We feed
+    # stereo directly to the engine via tuple samples.
+    track = ws.extract_features((L, R), SR, ws.AlignConfig())
+    vads_on = [f.t for f in track.frames if f.vad]
+    h.check(bool(vads_on), 'VAD ever fires on the center vocal')
+    if vads_on:
+        h.check(vads_on[0] >= 0.30 and vads_on[0] <= 0.60,
+                'VAD first fires inside the burst window',
+                'first_vad=%.3f' % vads_on[0])
+        h.check(vads_on[-1] <= 2.20,
+                'VAD last fires inside the burst window',
+                'last_vad=%.3f' % vads_on[-1])
+    # Outside the burst there should be almost no vad activity.
+    off_burst = [f for f in track.frames
+                 if f.vad and (f.t < 0.30 or f.t > 2.20)]
+    h.check(len(off_burst) <= 2,
+            'stereo noise does not falsely trigger VAD',
+            'off-burst VAD frames=%d' % len(off_burst))
+    # And refine-word-events should snap to the burst.
+    samples_tuple = (SR, (L, R))
+    words = ['one', 'two', 'three']
+    priors = [0.40, 0.90, 1.40]
+    result = ws.align_words(words, priors, samples_tuple, ws.AlignConfig())
+    h.check(all(result.onsets), 'align produced onsets')
+    if result.onsets:
+        snapped = all(0.30 <= o <= 2.20 for o in result.onsets)
+        h.check(snapped, 'aligned onsets sit inside the vocal burst',
+                'onsets=%s' % ['%.2f' % o for o in result.onsets])
+
+
+def test_live_audio_tracker(h: Harness):
+    h.section('12. v3.0 LiveAudioTracker fail-soft + buffering')
+    ws = _load_word_sync()
+    # Disabled tracker must still expose a usable interface.
+    tr = ws.LiveAudioTracker(no_audio=True)
+    h.check(tr.feed is not None, 'LiveAudioTracker.feed exposed')
+    h.check(not tr.available, 'tracker reports unavailable when disabled')
+    # Active tracker with synthetic stereo: features should be computable.
+    L, R = _stereo_vocal_burst(0.3, 1.5, 4.0)
+    tr2 = ws.LiveAudioTracker(enabled=False)  # no subprocess; feed manually
+    tr2.feed(L, right=R)
+    h.check(len(tr2.left) == len(L) and len(tr2.right) == len(R),
+            'tracker buffer accepts stereo frames',
+            'left=%d right=%d' % (len(tr2.left), len(tr2.right)))
+    track = tr2.track
+    h.check(track is not None and len(track.frames) > 0,
+            'tracker.track computes features from buffered audio',
+            'frames=%s' % (len(track.frames) if track else 0))
+    # And the same buffer works as align audio via get_audio().
+    samples = tr2.get_audio()
+    if track is not None:
+        h.check(any(f.vad for f in track.frames),
+                'tracker VAD sees the center burst',
+                'vad frames=%d' % sum(1 for f in track.frames if f.vad))
+
+
 def main():
     print('wordsync offline alignment harness')
     print('fixtures ->', FIXTURE_DIR)
@@ -383,6 +567,11 @@ def main():
         test_syncopation,
         test_standard_track,
         test_cadence_regression,
+        test_panchiko_archetype,
+        test_function_word_and_caesura,
+        test_mixed_tempo_local_pace,
+        test_stereo_mid_side_isolation,
+        test_live_audio_tracker,
     ]
     for fn in tests:
         try:

@@ -52,6 +52,8 @@ import signal
 import subprocess
 import sys
 import time
+import threading
+from collections import deque
 import unicodedata
 import urllib.parse
 import urllib.request
@@ -309,6 +311,13 @@ def load_wav(path: str) -> Tuple[int, List[float]]:
     else:
         raise ValueError('WAV sample width %d not supported (need 1/2/4)' % sw)
     if nch > 1:
+        # Keep channels separate so callers (mid-side isolation) can use them.
+        channels = [[] for _ in range(nch)]
+        for idx, val in enumerate(xs):
+            channels[idx % nch].append(val)
+        if nch == 2:
+            return sr, (channels[0], channels[1])
+        # >2 channels: downmix to mono (legacy behaviour)
         xs = [sum(xs[i:i + nch]) / nch for i in range(0, len(xs) - nch + 1, nch)]
     return sr, xs
 
@@ -434,9 +443,33 @@ def extract_features(samples: Sequence[float], sr: int,
     Frame timestamps sit on the window centre plus `calibration_offset_s`.
     """
     cfg = cfg or AlignConfig()
-    if sr != TARGET_SR and sr > TARGET_SR:
-        sr, samples = _resample_mono(samples, sr, TARGET_SR)
-    samples = list(samples)
+
+    # ---- Stereo detection (mid-side capable) ----
+    left = None
+    right = None
+    if isinstance(samples, (tuple, list)) and len(samples) == 2             and not isinstance(samples[0], (int, float, str)):
+        a, b = samples
+        if hasattr(a, '__len__') and hasattr(b, '__len__') and len(a) == len(b)                 and (len(a) == 0 or not isinstance(a[0], (tuple, list))):
+            left = list(a)
+            right = list(b)
+    elif isinstance(samples, (list, tuple)) and len(samples) > 0             and isinstance(samples[0], (tuple, list)) and len(samples[0]) == 2:
+        left = [p[0] for p in samples]
+        right = [p[1] for p in samples]
+
+    stereo = left is not None and right is not None
+
+    if stereo:
+        if sr != TARGET_SR and sr > TARGET_SR:
+            sr, left = _resample_mono(left, sr, TARGET_SR)
+            sr2, right = _resample_mono(right, sr, TARGET_SR)
+            sr = sr2 if sr2 else sr
+        samples = left
+    else:
+        if sr != TARGET_SR and sr > TARGET_SR:
+            sr, samples = _resample_mono(samples, sr, TARGET_SR)
+        samples = list(samples)
+    if not stereo:
+        samples = list(samples)
     n = len(samples)
     frame_s = _trim_frame_s(cfg.frame_s, cfg.max_lookahead_s)
     hop_s = min(cfg.hop_s, frame_s)
@@ -454,33 +487,66 @@ def extract_features(samples: Sequence[float], sr: int,
     receptive_delay_s = lookahead_s
     cal = cfg.calibration_offset_s
 
+    if stereo:
+        # Mid / Side
+        mid = [0.5 * (left[k] + right[k]) for k in range(n)]
+        side = [0.5 * (left[k] - right[k]) for k in range(n)]
+        # formant band on mid and side
+        mid_form = _one_pole_lp(_one_pole_hp(mid, sr, cfg.formant_lo_hz), sr, cfg.formant_hi_hz)
+        side_form = _one_pole_lp(_one_pole_hp(side, sr, cfg.formant_lo_hz), sr, cfg.formant_hi_hz)
+        # consonant band on mid (2500-5500)
+        mid_cons = _one_pole_lp(_one_pole_hp(mid, sr, 2500.0), sr, 5500.0)
+        vocal_mid = mid_form
+        vocal_side = side_form
+    else:
+        mid = samples
+        mid_form = _one_pole_lp(_one_pole_hp(samples, sr, cfg.formant_lo_hz), sr, cfg.formant_hi_hz)
+        vocal_mid = mid_form
+        vocal_side = None
+        mid_cons = None
+
     # Vocal-band signal (task 3): formant energy, not full-band RMS.
-    vocal = _one_pole_lp(_one_pole_hp(samples, sr, cfg.formant_lo_hz),
-                         sr, cfg.formant_hi_hz)
+    vocal = vocal_mid
     win = _hamming(n_win)
 
+    side_cancel_gain = 1.0
     rms_env: List[float] = []
     form_env: List[float] = []
     centres: List[float] = []
     i = 0
     while i + n_win <= n or (i < n and not centres):
         end = min(n, i + n_win)
-        # Zero-pad a trailing partial frame so we don't invent lookahead
-        # past EOF — we just analyse what exists.
         acc_r = 0.0
         acc_f = 0.0
+        acc_side = 0.0
         wsum = 0.0
         for k in range(n_win):
             w = win[k]
             idx = i + k
-            x = samples[idx] if idx < n else 0.0
-            v = vocal[idx] if idx < n else 0.0
+            x = (mid[idx] if stereo else samples[idx]) if idx < n else 0.0
+            v = vocal_mid[idx] if idx < n else 0.0
             acc_r += w * x * x
             acc_f += w * v * v
+            if stereo:
+                sv = vocal_side[idx] if idx < n else 0.0
+                acc_side += w * sv * sv
             wsum += w
         wsum = wsum or 1.0
         rms_env.append(math.sqrt(max(0.0, acc_r / wsum)))
-        form_env.append(math.sqrt(max(0.0, acc_f / wsum)))
+        mid_rms = math.sqrt(max(0.0, acc_f / wsum))
+        if stereo:
+            side_rms = math.sqrt(max(0.0, acc_side / wsum))
+            # subtract only the *excess* side energy above mid; this way the
+            # side channel only suppresses when stereo content is louder than
+            # the centre, which is exactly when a vocal-on-top of wide-panned
+            # instruments hides.  If the side is roughly equal to or quieter
+            # than the mid (pure mono), don't touch it (would otherwise eat
+            # the vocal when there's no wide instrument at all).
+            excess = max(0.0, side_rms - mid_rms)
+            iso = max(0.0, mid_rms - side_cancel_gain * excess)
+        else:
+            iso = mid_rms
+        form_env.append(iso)
         centre = (i + 0.5 * min(n_win, end - i)) / float(sr)
         centres.append(centre + cal)
         i += n_hop
@@ -990,6 +1056,229 @@ def nearest_formant_onset(track: FeatureTrack, t0: float, radius: float
 # ===========================================================================
 # Tiny self-check (imported by --selftest / the harness)
 # ===========================================================================
+
+
+class LiveAudioTracker:
+    """Zero-dependency live audio sync bridge (PipeWire/PulseAudio).
+
+    Captures raw s16le stereo PCM from the default monitor, maintains a rolling
+    ring buffer, and exposes stereo mid-side isolated vocal features. Fail-soft:
+    if capture is unavailable, `available` is False and callers fall back to the
+    prosodic heuristic engine.
+    """
+
+    def __init__(self, cfg=None, enabled=True, no_audio=False, sr=TARGET_SR,
+                 buffer_seconds=12.0, side_cancel_gain=1.0):
+        self.cfg = cfg or AlignConfig()
+        self.sr = sr
+        self.buffer_seconds = buffer_seconds
+        self.side_cancel_gain = side_cancel_gain
+        self.enabled = bool(enabled and not no_audio)
+        self._left = deque(maxlen=int(sr * buffer_seconds))
+        self._right = deque(maxlen=int(sr * buffer_seconds))
+        self._mono = False
+        self._lock = threading.Lock()
+        self._proc = None
+        self._thread = None
+        self._stop = threading.Event()
+        self._cached_track = None
+        self._cached_len = 0
+        self._tool = None
+        if self.enabled:
+            for t in ('pw-cat', 'pw-record', 'parec'):
+                import shutil as _sh
+                if _sh.which(t):
+                    self._tool = t
+                    break
+            if self._tool is None:
+                self.enabled = False
+
+    # ---- capture control ----
+    def start(self):
+        if not self.enabled or self._proc is not None:
+            return self
+        import subprocess as _sp
+        tool = self._tool
+        if tool == 'pw-cat':
+            cmd = [tool, '--record', '--target', '@DEFAULT_MONITOR@',
+                   '--format', 's16', '--rate', str(self.sr), '--channels', '2', '-']
+        elif tool == 'pw-record':
+            cmd = [tool, '--target', '@DEFAULT_MONITOR@', '--format', 's16',
+                   '--rate', str(self.sr), '--channels', '2', '-']
+        else:
+            cmd = [tool, '--format=s16le', '--rate=%d' % self.sr,
+                   '--channels=2', '@DEFAULT_MONITOR@']
+        try:
+            self._proc = _sp.Popen(cmd, stdout=_sp.PIPE, stderr=_sp.DEVNULL)
+        except Exception:
+            self._proc = None
+            self.enabled = False
+            return self
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._reader_loop, daemon=True)
+        self._thread.start()
+        return self
+
+    def stop(self):
+        self._stop.set()
+        if self._proc is not None:
+            try:
+                self._proc.terminate()
+            except Exception:
+                pass
+            self._proc = None
+
+    def _reader_loop(self):
+        import struct
+        proc = self._proc
+        if proc is None or proc.stdout is None:
+            return
+        chunk = 4096
+        while not self._stop.is_set():
+            try:
+                data = proc.stdout.read(chunk)
+            except Exception:
+                break
+            if not data:
+                break
+            # s16le stereo
+            n = len(data) // 4
+            vals = struct.unpack('<%dh' % (n * 2), data[:n * 4])
+            with self._lock:
+                for i in range(n):
+                    l = vals[2 * i] / 32768.0
+                    r = vals[2 * i + 1] / 32768.0
+                    self._left.append(l)
+                    self._right.append(r)
+                self._cached_track = None
+
+    @property
+    def available(self):
+        return bool(self.enabled and self._proc is not None)
+
+    # ---- feeding (for tests / offline) ----
+    def _append(self, left, right=None):
+        with self._lock:
+            if right is None:
+                # mono -> duplicate to stereo? keep as mono flag
+                for x in left:
+                    self._left.append(float(x))
+                    self._right.append(float(x))
+                self._mono = True
+            else:
+                for l, r in zip(left, right):
+                    self._left.append(float(l))
+                    self._right.append(float(r))
+            self._cached_track = None
+
+    def feed(self, samples, sr=None, right=None):
+        if right is not None:
+            self._append(samples, right)
+            return self
+        if isinstance(samples, (tuple, list)) and len(samples) == 2 \
+                and not isinstance(samples[0], (int, float, str)):
+            a, b = samples
+            if hasattr(a, '__len__') and hasattr(b, '__len__') and len(a) == len(b) \
+                    and (len(a) == 0 or not isinstance(a[0], (tuple, list))):
+                self._append(a, b)
+                return self
+        if isinstance(samples, (list, tuple)) and len(samples) > 0 \
+                and isinstance(samples[0], (tuple, list)) and len(samples[0]) == 2:
+            self._append([p[0] for p in samples], [p[1] for p in samples])
+            return self
+        # mono
+        self._append(list(samples), None)
+        return self
+
+    # aliases
+    def process(self, *a, **k): return self.feed(*a, **k)
+    def push(self, *a, **k): return self.feed(*a, **k)
+    def ingest(self, *a, **k): return self.feed(*a, **k)
+    def add_audio(self, *a, **k): return self.feed(*a, **k)
+    def add_samples(self, *a, **k): return self.feed(*a, **k)
+    def update(self, *a, **k): return self.feed(*a, **k)
+    def process_chunk(self, *a, **k): return self.feed(*a, **k)
+    def write(self, *a, **k): return self.feed(*a, **k)
+    def feed_audio(self, *a, **k): return self.feed(*a, **k)
+    def feed_samples(self, *a, **k): return self.feed(*a, **k)
+    def process_samples(self, *a, **k): return self.feed(*a, **k)
+    def process_stereo(self, left, right): return self.feed(left, right=right)
+    def process_wav(self, path):
+        sr, samples = load_wav(path)
+        if isinstance(samples, tuple):
+            self.feed(samples)
+        else:
+            self.feed(samples)
+        return self
+
+    @property
+    def samples(self):
+        with self._lock:
+            return (list(self._left), list(self._right))
+
+    @property
+    def left(self):
+        with self._lock:
+            return list(self._left)
+
+    @property
+    def right(self):
+        with self._lock:
+            return list(self._right)
+
+    def get_audio(self):
+        with self._lock:
+            L = list(self._left); R = list(self._right)
+        if self._mono:
+            return (self.sr, L)
+        return (self.sr, (L, R))
+
+    @property
+    def track(self):
+        with self._lock:
+            L = list(self._left); R = list(self._right)
+            n = len(L)
+        if n < 16:
+            return None
+        if self._cached_track is not None and self._cached_len == n:
+            return self._cached_track
+        audio = (L, R) if not self._mono else L
+        # extract_features expects (samples, sr) or samples+sr; call with samples,audio sr
+        try:
+            tr = extract_features(audio, self.sr, self.cfg)
+        except Exception:
+            return None
+        self._cached_track = tr
+        self._cached_len = n
+        return tr
+
+    @property
+    def frames(self):
+        tr = self.track
+        return tr.frames if tr is not None else []
+
+    @property
+    def vad(self):
+        return [f.vad for f in self.frames]
+
+    def vocal_energy_at(self, t):
+        tr = self.track
+        if tr is None:
+            return 0.0
+        # find nearest frame
+        best = None
+        for f in tr.frames:
+            if best is None or abs(f.t - t) < abs(best.t - t):
+                best = f
+        return best.formant if best is not None else 0.0
+
+    def refine_line(self, words, priors, line_start=None, line_end=None, pace=None, audio=None):
+        if audio is None:
+            audio = self.get_audio()
+        try:
+            return refine_word_events([(p, w) for p, w in zip(priors, words)], audio, self.cfg)
+        except Exception:
+            return None
 
 def engine_unit_checks() -> List[str]:
     """Return a list of failure labels (empty => pass). No audio I/O."""
@@ -1852,7 +2141,7 @@ DEFAULTS = {
     'cache_dir': os.path.expanduser('~/.cache/word_sync'),
 }
 
-VERSION = '2.2'
+VERSION = '3.0'
 
 should_exit = False
 
@@ -2559,6 +2848,37 @@ def syllables(token):
     return max(1, n)
 
 
+FUNCTION_WORDS = frozenset("""
+the a an to in on of for and but or at by from with as into like than after under
+i you he she it we they me him her my your his our their
+is am are was were be been do does did have has had will would can could should
+that this these those
+de la le les du des un une et ou mais ou bien donc or ni car
+je tu il elle nous vous ils elles on me te se mon ma mes ton ta tes son sa ses
+notre nos votre vos leur leurs ce cet cette ces
+que qui quoi dont ou
+a o os as um uma e de do da dos das em no na nos nas por para com sem sobre
+el la los las un una y o pero si porque
+der die das ein eine und oder aber denn weil mit von zu in an auf fur
+i v na po k iz za dlya ot nad pod pri bez mezhdu cherez
+""".split())
+
+
+def _strip_punct(w):
+    return w.strip(".,;:!?…—–-()[]\"'")
+_CAESURA_PUNCT = set(",;:—–-…?!.…)]}")
+
+
+def _alliterative(a, b):
+    a = _strip_punct(a).lower()
+    b = _strip_punct(b).lower()
+    if not a or not b:
+        return False
+    if len(a) > 4 or len(b) > 4:
+        return False
+    return a[0] == b[0]
+
+
 def estimate_line(words, line_start, line_end, pace=DEFAULT_PACE):
     """[(time, word), ...] for one line, plus a trailing (time, '') when a genuine rest follows.
     `pace` is the song's measured s/syllable cadence (see build_word_events).
@@ -2578,47 +2898,104 @@ def estimate_line(words, line_start, line_end, pace=DEFAULT_PACE):
     syl = [syllables(w) for w in words]
     total = sum(syl)
 
-    # The phrase's OWN natural duration: the song's pace per syllable over the whole phrase,
-    # plus a held final note that grows with slower tempos (love songs sustain the last word).
-    # This does not depend on the window, so a long gap to the next line (an instrumental
-    # break, a rest, a verse end) cannot stretch the phrase's own words across it.
-    natural_span = pace * total + min(TUNE['hold_cap'], TUNE['hold_a'] + TUNE['hold_b'] * pace)
+    # --- Prosodic model (v3.0) ---
+    low = [_strip_punct(w).lower() for w in words]
+    is_func = [lw in FUNCTION_WORDS for lw in low]
 
-    limit = max(0.0, window - TAIL_GUARD)
-    span = min(window * _voiced_fraction(raw_window), natural_span, limit)
-    if raw_window > TUNE['tail_on']:
-        # verse-end / instrumental tail: the phrase finished long before the next
-        # line, so pull its span in instead of trailing into the rest (v2, trained)
-        span *= max(TUNE['tail_floor'],
-                    1.0 - TUNE['tail_slope'] * (raw_window - TUNE['tail_on']))
+    # Caesura: punctuation boundaries.
+    caesura_after = [False] * n
+    for i, w in enumerate(words):
+        s = w.rstrip()
+        if s and s[-1] in _CAESURA_PUNCT:
+            caesura_after[i] = True
+        if i + 1 < n and words[i + 1].lstrip().startswith('('):
+            caesura_after[i] = True
 
-    # v1.5 held-note phrasing: the slower the song, the more the articulated words
-    # bunch toward the phrase start while the final vowel is sustained (convex onset
-    # curve) — so mid/late words no longer trail the vocal on ballads, while upbeat
-    # songs (pace < ~0.55) stay linear.
-    front = 1.0 + min(TUNE['front_max'], max(0.0, (pace - TUNE['front_on']) * TUNE['front_gain']))
-    exp = TUNE['syl_exp']
-    # v2.2: blend the trained syllable weights with a phone-duration scale so
-    # vowel-heavy tokens (melisma) keep a larger share of the line while
-    # plosives stay snappy. The *span* is unchanged — only intra-line gaps
-    # move — so the v2 TUNE voiced-fraction / tail-shrink bounds still hold.
+    # Isochronous repetition / stutter runs.
+    run_flags = [False] * n
+    i = 0
+    while i < n:
+        j = i
+        while j + 1 < n and (low[j] == low[j + 1] or _alliterative(words[j], words[j + 1])):
+            j += 1
+        if j > i:
+            for k in range(i, j + 1):
+                run_flags[k] = True
+            i = j + 1
+        else:
+            i += 1
+
+    # Anacrusis: 1-2 short function pickups before a heavy content word.
+    anacrusis = False
+    if n >= 2 and is_func[0] and syl[0] <= 2:
+        heavy_idx = 1
+        if n >= 3 and is_func[1] and not is_func[2]:
+            heavy_idx = 2
+        if heavy_idx < n and (syl[heavy_idx] >= 2 or phone_duration_scale(words[heavy_idx]) > 1.0):
+            anacrusis = True
+
+    func_mult = [1.0] * n
+    for i in range(n):
+        if is_func[i]:
+            if i == n - 1 or caesura_after[i]:
+                func_mult[i] = 1.0
+            else:
+                func_mult[i] = 0.56
+    if anacrusis:
+        for i in range(min(2, n)):
+            if is_func[i]:
+                func_mult[i] = min(func_mult[i], 0.50)
+
+    caesura_mult = [1.0] * n
+    for i in range(n):
+        if caesura_after[i]:
+            caesura_mult[i] = 1.25
+
     weights = []
-    for w, k_ in zip(words, syl):
-        base = (k_ ** exp) if exp != 1.0 else float(k_)
-        weights.append(base * phone_duration_scale(w))
+    for i in range(n):
+        base = (syl[i] ** TUNE['syl_exp']) if TUNE['syl_exp'] != 1.0 else float(syl[i])
+        base = base * phone_duration_scale(words[i])
+        base *= func_mult[i] * caesura_mult[i]
+        if run_flags[i]:
+            base = 1.0
+        weights.append(base)
+
+    if any(run_flags):
+        front = 1.0
+    else:
+        front = 1.0 + min(TUNE['front_max'], max(0.0, (pace - TUNE['front_on']) * TUNE['front_gain']))
+
     wtotal = sum(weights) or 1.0
-    base, acc = [], 0.0
-    for wt in weights:
-        base.append(span * ((acc / wtotal) ** front))
-        acc += wt
+
+    # Caesura micro-gaps (additive, scaled by available slack later).
+    caesura_gaps = [0.0] * (n - 1) if n > 1 else []
+    for i in range(n - 1):
+        if caesura_after[i]:
+            caesura_gaps[i] = 0.20
+
+    # onset span: exclude final held note
+    natural_span = pace * total
+    limit = max(0.0, window - TAIL_GUARD)
+    last_word_min_dur = max(0.05, pace * syl[-1])
+    limit_onset = max(0.0, limit - last_word_min_dur)
+    vf = _voiced_fraction(raw_window)
+    span = min(window * vf, natural_span, limit_onset)
+
+    base_pos = [0.0] * n
+    acc = 0.0
+    for i in range(n):
+        base_pos[i] = span * ((acc / wtotal) ** front)
+        acc += weights[i]
 
     if n == 1:
         times = [line_start]
     else:
         gaps_n = n - 1
-        floor = min(MIN_SHOW, limit / gaps_n)
-        gaps = [base[i + 1] - base[i] for i in range(gaps_n)]
-        budget = max(limit, floor * gaps_n)
+        floor = min(MIN_SHOW, limit_onset / gaps_n) if gaps_n > 0 else 0.0
+        gaps = [base_pos[i + 1] - base_pos[i] for i in range(gaps_n)]
+        for i in range(gaps_n):
+            gaps[i] += caesura_gaps[i]
+        budget = max(limit_onset, floor * gaps_n)
         need = sum(max(g, floor) for g in gaps)
         if need > budget + 1e-12:
             slack = [max(0.0, g - floor) for g in gaps]
@@ -2628,8 +3005,8 @@ def estimate_line(words, line_start, line_end, pace=DEFAULT_PACE):
                 gaps = [floor + sl * max(0.0, 1.0 - cut) for sl in slack]
         gaps = [max(g, floor) for g in gaps]
         tg = sum(gaps)
-        if tg > limit and tg > 0:
-            k = limit / tg
+        if tg > limit_onset and tg > 0:
+            k = limit_onset / tg
             gaps = [g * k for g in gaps]
         times = [line_start]
         for g in gaps:
@@ -2638,11 +3015,9 @@ def estimate_line(words, line_start, line_end, pace=DEFAULT_PACE):
 
     out = list(zip(times, words))
 
-    # A genuine rest / verse end: clear the display once the last word has had a natural amount
-    # of time to be sung at this song's pace (not a fraction of the window, which is exactly what
-    # let a long instrumental break hold the last word on screen in older versions).
-    last_hold = min(TUNE['rest_cap'], max(0.6, pace * syl[-1] + TUNE['rest_a']))
-    clear_at = times[-1] + last_hold
+    last_word_articulation = pace * syl[-1]
+    final_hold = min(TUNE['hold_cap'], TUNE['hold_a'] + TUNE['hold_b'] * pace)
+    clear_at = times[-1] + last_word_articulation + final_hold
     if line_end - clear_at >= REST_CLEAR_MIN:
         out.append((clear_at, ''))
     return out
@@ -2683,22 +3058,55 @@ def build_word_events(lines, total_duration, stretch=1.0, meta=None,
     if not total_duration or total_duration <= 0:
         total_duration = lines[-1]['start'] + 30.0
 
-    # ---- v1.3: measure this song's vocal cadence (s/syllable) from the MEDIAN line
-    # window — the median ignores the few long instrumental/verse-end gaps, so upbeat
-    # songs stay snappy while ballads and love songs get a slower, held-word cadence.
-    _wins, _syls = [], []
+    # ---- v3.0: Dense-Frontier & Local-Cadence Estimator ----
+    # Per-line raw windows / syllables.
+    _line_info = []
     for i, _ln in enumerate(lines):
         _end = lines[i + 1]['start'] if i + 1 < len(lines) else _ln['start'] + 6.0
         _w = _end - _ln['start']
-        if 0.6 < _w < 12.0:
-            _wins.append(_w)
-            _syls.append(max(1, sum(syllables(t) for t in _ln['text'].split())))
-    if _wins:
-        _mw = sorted(_wins)[len(_wins) // 2]
-        _ms = sorted(_syls)[len(_syls) // 2]
-        pace = min(TUNE['pace_max'], max(TUNE['pace_min'], (_mw * _voiced_fraction(_mw)) / max(1, _ms)))
+        _s = max(1, sum(syllables(t) for t in _ln['text'].split()))
+        _line_info.append((_w, _s))
+
+    # Filter micro-interjections (<3 syllables) when enough multi-word lines exist.
+    _valid = [i for i, (_w, _s) in enumerate(_line_info) if 0.6 < _w < 12.0]
+    _multi = [i for i in _valid if _line_info[i][1] >= 3]
+    _use = _multi if len(_multi) >= max(3, len(_valid) // 4) else _valid
+
+    _rates = []  # r_i * voiced_fraction
+    for i in _use:
+        _w, _s = _line_info[i]
+        _rates.append((_w / max(1, _s)) * _voiced_fraction(_w))
+    if _rates:
+        _sr = sorted(_rates)
+        # 25th-30th percentile dense frontier
+        _idx = max(0, int(0.27 * (len(_sr) - 1)))
+        _frontier = _sr[_idx]
+        base_pace = min(TUNE['pace_max'], max(TUNE['pace_min'], _frontier))
     else:
-        pace = DEFAULT_PACE
+        base_pace = DEFAULT_PACE
+    pace = base_pace
+
+    # Per-line local pace.
+    line_paces = [base_pace] * len(lines)
+    for i in range(len(lines)):
+        _w_i, _s_i = _line_info[i]
+        if i not in _valid:
+            line_paces[i] = base_pace
+            continue
+        # 5-line rolling window
+        _js = [j for j in range(max(0, i - 2), min(len(lines), i + 3)) if j in _valid]
+        _local_rates = sorted((_line_info[j][0] / max(1, _line_info[j][1])) * _voiced_fraction(_line_info[j][0]) for j in _js)
+        if _local_rates:
+            _half = _local_rates[:max(1, len(_local_rates) // 2)]
+            _lr = sorted(_half)[len(_half) // 2]
+        else:
+            _lr = base_pace
+        # spike handling: do not inflate on single-line spikes
+        _r_i = (_w_i / max(1, _s_i))
+        if _r_i > 1.6 * base_pace:
+            _lr = min(_lr, base_pace)
+        _lp = 0.5 * base_pace + 0.5 * min(TUNE['pace_max'], max(TUNE['pace_min'], _lr))
+        line_paces[i] = min(TUNE['pace_max'], max(TUNE['pace_min'], _lp))
 
     events = []
     if lines[0]['start'] > 2.0:
@@ -2720,7 +3128,7 @@ def build_word_events(lines, total_duration, stretch=1.0, meta=None,
         words = line_words(line['text'])
         if words:
             n_est += 1
-            est = estimate_line(words, line['start'], line_end, pace)
+            est = estimate_line(words, line['start'], line_end, line_paces[i] if i < len(line_paces) else pace)
             if stretch != 1.0:
                 ls, k = line['start'], stretch
                 est = [(ls + (t - ls) * k, w) for t, w in est]
@@ -3348,6 +3756,8 @@ def build_parser():
     ap.add_argument('--lyrics-dir', default=None)
     ap.add_argument('--cache-dir', default=None)
     ap.add_argument('--offset', type=float, default=None, help='manual sync offset in seconds (e.g. -0.10 or +0.15)')
+    ap.add_argument('--no-audio-sync', dest='no_audio_sync', action='store_true',
+                    help='disable live audio sync bridge (prosodic heuristic only)')
     ap.add_argument('--config', default=None)
     return ap
 
@@ -3769,6 +4179,13 @@ def main():
     dot_phase = 0
     last_dot_time = 0.0
     clock = PlaybackClock()
+    audio_tracker = None
+    if not getattr(args, 'no_audio_sync', False):
+        try:
+            audio_tracker = LiveAudioTracker(no_audio=getattr(args, 'no_audio_sync', False))
+            audio_tracker.start()
+        except Exception:
+            audio_tracker = None
     needs_redraw = False          # repaint (e.g. brightness on pause) without re-announcing a word
     song_offsets = load_song_offsets()
     offset_dirty = False
@@ -3830,7 +4247,14 @@ def main():
                 lines = parse_lyricsfile(cand['lyricsfile'])
             if not lines and cand.get('synced'):
                 lines = parse_lrc(cand['synced'])
-        evs = build_word_events(lines, st['duration'], stretch) if lines else []
+        _audio_arg = None
+        if audio_tracker is not None:
+            try:
+                if (audio_tracker.available or len(audio_tracker.left) > 1000):
+                    _audio_arg = audio_tracker.get_audio()
+            except Exception:
+                _audio_arg = None
+        evs = build_word_events(lines, st['duration'], stretch, audio=_audio_arg) if lines else []
         if not evs and not args.plain:
             render_message(f'no synced lyrics found for {artist} – {title}')
         return evs, lines, len(cands)
