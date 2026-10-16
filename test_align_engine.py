@@ -604,6 +604,34 @@ def test_display_state_dead_zone(h: Harness):
             'shows first word at 4.0 s', 'show_word=%s' % d['show_word'])
 
 
+def test_interlude_to_singing_boundary(h: Harness):
+    """The word that lands exactly on the interlude boundary must be
+    shown — the INTERLUDE→SINGING transition must fire at pos >= upcoming
+    (not pos > upcoming). Regression: v3.1 used `t > pos` which skipped
+    the word at the boundary, leaving the display stuck on dots."""
+    h.section('14b. v3.1 INTERLUDE→SINGING boundary')
+    ws = _load_word_sync()
+    ds = ws.DisplayStateMachine()
+    events = [(0.0, ''), (10.0, 'first'), (10.4, 'word'), (11.2, 'song'),
+              (12.0, ''), (15.0, 'second'), (15.4, 'line'), (16.0, '')]
+    # Sing the first line
+    d = ds.step(10.0, events, now=10.0)
+    h.check(d['state'] == 'SINGING' and d['show_word'] == 'first',
+            'SINGING at 10.0 s', 'state=%s word=%s' % (d['state'], d['show_word']))
+    # Enter the interlude
+    d = ds.step(12.0, events, now=12.0)
+    h.check(d['state'] == 'INTERLUDE', 'INTERLUDE at 12.0 s', 'got %s' % d['state'])
+    # Just before the second line
+    d = ds.step(14.99, events, now=14.99)
+    h.check(d['state'] == 'INTERLUDE', 'INTERLUDE at 14.99 s', 'got %s' % d['state'])
+    # Exactly at the second line's start
+    d = ds.step(15.0, events, now=15.0)
+    h.check(d['state'] == 'SINGING', 'SINGING at 15.0 s (boundary)',
+            'got %s' % d['state'])
+    h.check(d['show_word'] == 'second',
+            'shows the boundary word "second"', 'got %s' % d['show_word'])
+
+
 def test_post_vocal_freeze(h: Harness):
     h.section('15. v3.1 post-vocal VAD freeze')
     ws = _load_word_sync()
@@ -797,6 +825,7 @@ def main():
         test_live_audio_tracker,
         test_phantom_first_word,
         test_display_state_dead_zone,
+        test_interlude_to_singing_boundary,
         test_post_vocal_freeze,
         test_audio_onset_snap,
         test_lrc_auto_pick,

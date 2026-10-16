@@ -3359,22 +3359,31 @@ class DisplayStateMachine:
                 # Audio-driven early clear: if VAD has been silent for
                 # >350 ms in the centre channel AND we are at or past
                 # the active word's time, drop to INTERLUDE right now.
+                # The pos check guards against bogus silence_ms values
+                # that come from a fresh audio buffer whose wall-clock
+                # time doesn't align with the player's song-clock.
                 audio_freeze = False
                 if audio_state and audio_state.get('silence_ms', 0) > 350 \
-                        and pos >= current_word_t - 0.05:
+                        and pos >= current_word_t - 0.05 \
+                        and pos < current_word_t + 0.6:
+                    # Only fire if we're close to the active word's
+                    # time — never far past it (that's the LRC's job
+                    # via clear_t) and never far before it (that
+                    # would be the bogus-fresh-buffer case).
                     audio_freeze = True
 
                 if audio_freeze or pos >= clear_t:
                     self._enter(DS_INTERLUDE, now)
 
         # ---- INTERLUDE: between lines. Stay until the *next* non-empty
-        #      word is within 350 ms (or its time has come). When audio
-        #      is available, prefer a vocal-rise trigger over the
-        #      timeline alone so we don't pop back into SINGING just
-        #      because the LRC says the next word is close.
+        #      word's time has come (pos >= upcoming), OR audio confirms
+        #      a vocal rise at the next word. `upcoming` is the first
+        #      non-empty word at or after pos (within 10 ms), so a word
+        #      that lands exactly on the interlude boundary still
+        #      triggers the transition.
         if self.state == DS_INTERLUDE:
             upcoming = next((t for t, w in events
-                             if w and t > pos), None)
+                             if w and t >= pos - 0.01), None)
             if upcoming is None:
                 if pos >= last_event_t:
                     self._enter(DS_ENDING, now)
@@ -3384,11 +3393,6 @@ class DisplayStateMachine:
                         and audio_state.get('vocal_at_next_word', False):
                     audio_vocal = True
                 if audio_vocal or pos >= upcoming:
-                    # audio-driven: jump in on the vocal rise.
-                    # timeline-driven: only after the *exact* time of
-                    # the next word (not 350 ms early). This stops
-                    # audio-freeze INTERLUDEs from being immediately
-                    # undone by the LRC's "next line is 200 ms away".
                     self._enter(DS_SINGING, now)
                 elif pos >= last_event_t:
                     self._enter(DS_ENDING, now)
@@ -3597,7 +3601,10 @@ class PhaseLocker:
 
     def snapshot(self, pos):
         """Read the current audio state and return a small dict used by
-        the state machine. Never raises."""
+        the state machine. Never raises. `silence_ms` is the time since
+        the last vocal frame, and is clamped to a safe upper bound so
+        a fresh audio buffer whose wall-clock time doesn't align with
+        the player's song-clock can't force the display into INTERLUDE."""
         out = {'vad_rising': False,
                'silence_ms': 0,
                'vocal_at_first_word': False,
@@ -3616,19 +3623,32 @@ class PhaseLocker:
             vads = [f.vad for f in near]
             rising = (sum(vads) >= max(2, len(vads) // 2))
             out['vad_rising'] = rising
-            # Silence duration: how long since the last vad=True frame
-            last_vad_t = None
-            for f in sorted(track.frames, key=lambda f: f.t):
-                if f.t > pos:
-                    break
-                if f.vad:
-                    last_vad_t = f.t
-            if last_vad_t is None:
-                out['silence_ms'] = int((pos) * 1000)
-            else:
-                out['silence_ms'] = int((pos - last_vad_t) * 1000)
             out['vocal_at_next_word'] = rising
             out['vocal_at_first_word'] = rising
+            # Silence duration: how long since the last vad=True frame
+            # within a small window of pos. Crucially, only count
+            # frames whose timestamp is actually *near* pos — frames
+            # that belong to a much earlier or later part of the song
+            # (or to a freshly-captured live buffer) must not poison
+            # the silence estimate.
+            last_vad_t = None
+            for f in sorted(track.frames, key=lambda f: f.t):
+                if f.t > pos + 0.5:
+                    break
+                if f.vad and abs(f.t - pos) < 2.0:
+                    last_vad_t = f.t
+            if last_vad_t is not None:
+                silence = (pos - last_vad_t) * 1000
+                if silence < 0:
+                    silence = 0
+                # Hard cap: never report more than 1500 ms of silence.
+                # Above that the audio is either irrelevant to the
+                # current pos (different song, stale buffer) or the
+                # detector is dead. In either case, do not freeze the
+                # display based on this signal.
+                if silence > 1500:
+                    silence = 0
+                out['silence_ms'] = int(silence)
             return out
         except Exception:
             return out
