@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Compatibility launcher for the historical uploaded filename."""
-from word_sync import main
+from wordsync_v3 import main
 
 
 if __name__ == '__main__':

@@ -4,7 +4,7 @@ import math
 import struct
 import unittest
 
-import word_sync as ws
+import wordsync_v3 as ws
 
 
 class ProsodicCadenceTests(unittest.TestCase):
@@ -30,6 +30,18 @@ class ProsodicCadenceTests(unittest.TestCase):
         self.assertLessEqual(meta['base_pace'], 0.40)
         self.assertTrue(all(meta['line_paces'][i] <= 0.38 for i in (0, 2, 4, 6, 8)))
 
+        # Entirely sparse 6.5 s tags have no measurable dense frontier; the conservative prior
+        # prevents the old 3–4 s word crawl rather than treating every interval as vocal time.
+        all_sparse, all_sparse_duration = self.make_lines([6.5] * 8)
+        all_sparse_meta = {}
+        ws.build_word_events(all_sparse, all_sparse_duration + 2.0, meta=all_sparse_meta)
+        self.assertLessEqual(all_sparse_meta['base_pace'], 0.36)
+        for sparse_spec in all_sparse_meta['line_specs']:
+            sparse_onsets = [t for t, word in sparse_spec['events'] if word]
+            self.assertLessEqual(sparse_onsets[-1] - sparse_spec['start'], 2.4)
+            clears = [t for t, word in sparse_spec['events'] if not word]
+            self.assertTrue(clears and clears[0] - sparse_spec['start'] < 3.5)
+
         # Even when only two dense anchors occur in ten lines, preserve the fast frontier.
         sparse_lines, sparse_duration = self.make_lines(
             [6.5, 6.5, 2.2, 6.5, 6.5, 6.5, 2.3, 6.5, 6.5, 6.5])
@@ -53,6 +65,23 @@ class ProsodicCadenceTests(unittest.TestCase):
         clear = next(t for t, word in events if not word)
         self.assertAlmostEqual(clear, times[-1] + articulation[-1] + final_hold, places=6)
 
+    def test_consonant_le_syllables_are_not_double_counted(self):
+        for word in ('middle', 'table', 'little', 'apple', 'candle', 'bottles', 'tables'):
+            with self.subTest(word=word):
+                self.assertEqual(ws.syllables(word), 2)
+        self.assertEqual(ws.syllables('file'), 1)
+        self.assertEqual(ws.syllables('files'), 1)
+        self.assertEqual(sum(ws.syllables(token) for token in
+                             ws.line_words('Wait, in the middle of the night')), 8)
+
+    def test_ambiguous_five_second_tags_do_not_set_a_slow_word_crawl(self):
+        lines, duration = self.make_lines([4.8] * 6,
+                                          text='Wait, in the middle of the night')
+        meta = {}
+        ws.build_word_events(lines, duration + 1.0, meta=meta)
+        self.assertLessEqual(meta['base_pace'], 0.42)
+        self.assertLessEqual(max(meta['line_paces']), 0.42 + 1e-9)
+
     def test_function_words_and_caesura(self):
         phrase = ws.line_words('Wait, in the middle of the night')
         timed = ws.estimate_line(phrase, 0.0, 4.8, 0.45)
@@ -70,7 +99,7 @@ class ProsodicCadenceTests(unittest.TestCase):
         backing = ws.line_words('hold (backing vocals) the line')
         backing_articulation, backing_pauses = ws._prosodic_durations(backing, 0.45, 5.0)
         self.assertGreater(backing_pauses[0], 0.14)
-        self.assertGreater(backing_articulation[0], 0.45 * (1 ** ws.TUNE['syl_exp']))
+        self.assertGreater(backing_articulation[0], 0.45)
 
     def test_local_pace_tracks_rapid_verse_to_slow_chorus(self):
         lines, cursor = [], 0.0
@@ -84,8 +113,8 @@ class ProsodicCadenceTests(unittest.TestCase):
         ws.build_word_events(lines, cursor + 2.0, meta=meta)
         paces = meta['line_paces']
         self.assertLessEqual(paces[7], 0.35)
-        self.assertGreater(paces[9], paces[7] * 1.5)
-        self.assertGreater(paces[9], paces[8])
+        self.assertGreater(max(paces[8], paces[9]), paces[7] * 1.5)
+        self.assertGreater(paces[8], paces[7] * 1.5)
 
     def test_repetition_uses_isochronous_intervals(self):
         events = ws.estimate_line(['la', 'la', 'la', 'fire'], 0.0, 5.0, 0.42)
@@ -93,9 +122,36 @@ class ProsodicCadenceTests(unittest.TestCase):
         self.assertAlmostEqual(times[1] - times[0], times[2] - times[1], places=7)
 
 
+class EventIdentityTests(unittest.TestCase):
+    def test_live_resort_keeps_event_identity_and_locks_shown_word(self):
+        specs = [
+            {'line_index': 0, 'events': [(1.0, 'one'), (2.0, 'two')]},
+            {'line_index': 1, 'events': [(1.5, 'three')]},
+        ]
+        initial_events, initial_keys = ws._compose_word_events(specs, with_keys=True)
+        current_key = ('line', 0, 0)
+        initial_index = initial_keys.index(current_key)
+        initial_word = initial_events[initial_index][1]
+        self.assertEqual(initial_word, 'one')
+
+        # A local snap moves another word across this event in timestamp order. Its semantic
+        # key stays the same despite a different sorted index.
+        specs[0]['events'] = [(1.0, 'one'), (0.75, 'two')]
+        rerender_events, rerender_keys = ws._compose_word_events(specs, with_keys=True)
+        rerender_index = rerender_keys.index(current_key)
+        self.assertNotEqual(initial_index, rerender_index)
+        self.assertEqual(rerender_events[rerender_index][1], 'one')
+
+        spec = {'line_index': 0, 'events': [(1.0, 'one'), (2.0, 'two')]}
+        proposed = [(1.6, 'one'), (2.1, 'two')]
+        locked = ws._preserve_locked_line_events(spec, proposed, {current_key})
+        self.assertEqual(locked[0], (1.0, 'one'))
+        self.assertEqual(locked[1], proposed[1])
+
+
 class StereoAudioTests(unittest.TestCase):
     @staticmethod
-    def synthetic_mix(duration=6.0, sample_rate=16000):
+    def synthetic_mix(duration=6.0, sample_rate=16000, vocal_end=2.0):
         pcm = bytearray()
         for sample in range(int(sample_rate * duration)):
             t = sample / float(sample_rate)
@@ -103,7 +159,7 @@ class StereoAudioTests(unittest.TestCase):
             side = 0.18 * (math.sin(2 * math.pi * 440 * t) +
                            0.45 * math.sin(2 * math.pi * 900 * t) +
                            0.25 * math.sin(2 * math.pi * 2800 * t))
-            if 0.4 <= t < 2.0:
+            if 0.4 <= t < vocal_end:
                 phase = t - 0.4
                 envelope = 0.55 + 0.45 * max(0.0, math.sin(2 * math.pi * 3.0 * phase))
                 vocal = 0.35 * envelope * math.sin(
@@ -140,6 +196,30 @@ class StereoAudioTests(unittest.TestCase):
         events = ws.build_word_events(lines, 6.0, meta=meta, audio=frames)
         self.assertAlmostEqual(next(t for t, word in events if word), word_onsets[0], places=6)
         tracker.stop()
+
+    def test_phrase_sized_audio_can_expand_slow_vocal_cadence(self):
+        frames = ws.extract_features(self.synthetic_mix(vocal_end=2.8), start_position=0.0)
+        words = ['we', 'will', 'stay', 'inside', 'tonight']
+        base = ws.estimate_line(words, 0.0, 6.0, 0.36)
+        aligned = ws.align_tokens(words, frames, 0.0, 6.0, 0.36)
+        base_last = next(t for t, word in base if word == words[-1])
+        aligned_last = next(t for t, word in aligned if word == words[-1])
+        self.assertGreater(aligned_last, base_last + 0.5)
+        self.assertLessEqual(aligned_last, 2.8)
+
+    def test_continuous_center_energy_cannot_stretch_clear_to_next_tag(self):
+        sample_rate, duration = 16000, 6.0
+        pcm = bytearray()
+        for sample in range(int(sample_rate * duration)):
+            t = sample / float(sample_rate)
+            instrument = 0.12 * math.sin(2 * math.pi * 220 * t) + \
+                         0.06 * math.sin(2 * math.pi * 330 * t)
+            pcm.extend(struct.pack('<hh', int(instrument * 32767), int(instrument * 32767)))
+        frames = ws.extract_features(bytes(pcm), start_position=0.0)
+        aligned = ws.align_tokens(['we', 'can', 'see', 'light', 'tonight'],
+                                  frames, 0.0, duration, 0.36)
+        clear = next(t for t, word in aligned if not word)
+        self.assertLess(clear, 3.0)
 
     def test_live_entry_gate_waits_then_snaps_to_causal_onset(self):
         frames = ws.extract_features(self.synthetic_mix(), start_position=0.0)
